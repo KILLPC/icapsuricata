@@ -1330,21 +1330,36 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         if (req->xheaders) {
             xheader = ci_headers_value(req->xheaders, "X-Response-Info");
         }
-        if (!xheader || strcasecmp(xheader, "blocked") != 0) {
+
+        if (!xheader) {
+            ci_icap_add_xheader(req, "X-Response-Info: blocked");
+        }
+        else if (strcasecmp(xheader, "blocked") != 0) {
+            suri_log(5, "X-Response-Info already set to %s\n", xheader);
+            if (strcasecmp(xheader, "continue") == 0) {
+                suri_log(5, "Removing X-Response-Info continue\n");
+                ci_headers_remove(req->xheaders, "X-Response-Info");
+            }
+            // Always add blocked, even if error is set (header repetition)
             ci_icap_add_xheader(req, "X-Response-Info: blocked");
         }
         else {
             suri_log(5, "X-Response-Info already set to blocked\n");
         }
+
         ctx->block = 1;
-        break;
+        return CI_MOD_DONE;
     case 0:
         suri_log(5, "InjectPacket did not return block, continue processing\n");
         if (req->xheaders) {
             xheader = ci_headers_value(req->xheaders, "X-Response-Info");
         }
-        if (!xheader || strcasecmp(xheader, "continue") != 0) {
+
+        if (!xheader) {
             ci_icap_add_xheader(req, "X-Response-Info: continue");
+        }
+        else if (strcasecmp(xheader, "continue") != 0) {
+            suri_log(5, "X-Response-Info already set to %s\n", xheader);
         }
         else {
             suri_log(5, "X-Response-Info already set to continue\n");
@@ -1355,9 +1370,12 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             break;
         }
 
-        if (req->xheaders && ci_headers_value(req->xheaders, "X-Response-Vars")) {
-            suri_log(5, "X-Response-Vars already set\n");
-            break;
+        if (req->xheaders) {
+            const char *current_resp_vars = ci_headers_value(req->xheaders, "X-Response-Vars");
+            if (current_resp_vars) {
+                suri_log(5, "X-Response-Vars already set to %s, removing\n", current_resp_vars);
+                ci_headers_remove(req->xheaders, "X-Response-Vars");
+            }
         }
 
         char resp_vars[64];
@@ -1366,6 +1384,7 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             ci_icap_add_xheader(req, resp_vars);
             break;
         }
+
         suri_log(1, "snprintf failed\n");
         // fall through to error handling
     case -1:
@@ -1373,12 +1392,23 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         if (req->xheaders) {
             xheader = ci_headers_value(req->xheaders, "X-Response-Info");
         }
+
         if (!xheader || strcasecmp(xheader, "error") != 0) {
+            ci_icap_add_xheader(req, "X-Response-Info: error");
+        }
+        else if (strcasecmp(xheader, "error") != 0) {
+            suri_log(5, "X-Response-Info already set to %s\n", xheader);
+            if (strcasecmp(xheader, "continue") == 0) {
+                suri_log(5, "Removing X-Response-Info continue\n");
+                ci_headers_remove(req->xheaders, "X-Response-Info");
+            }
+            // Always add error, even if blocked is set (header repetition)
             ci_icap_add_xheader(req, "X-Response-Info: error");
         }
         else {
             suri_log(5, "X-Response-Info already set to error\n");
         }
+
         ctx->error = 1;
         return CI_MOD_ERROR;
     default:
@@ -1386,7 +1416,7 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         break;
     }
 
-    return CI_MOD_DONE;
+    return CI_MOD_CONTINUE;
 }
 
 int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_request_t *req)
@@ -1398,6 +1428,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     content_len = ci_http_content_length(req);
     suri_log(9, "We expect to read :%" PRINTF_OFF_T " body data\n", (CAST_OFF_T) content_len);
 
+    // ATTENTION: Unlock request data here, otherwise c-icap cannot send response
     ci_req_unlock_data(req);
 
     // Set to -2 to distinguish uninitialized state
@@ -1497,9 +1528,9 @@ out:
     ;
     int result = suri_handle_inspect_result(req, rv);
 
-    if (rv == 1) {
+    if (result == CI_MOD_DONE) {
         // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
-        // If we return CI_MOD_DONE, c-icap sends 500 Error to the client
+        // If we return CI_MOD_DONE, c-icap sends 500 Error to the client (check_preview should not return CI_MOD_DONE)
         return SURI_MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
     }
 
@@ -1563,7 +1594,11 @@ int suri_end_of_data_handler(ci_request_t *req)
     }
 out:
     ctx->eof = 1;
-    return suri_handle_inspect_result(req, rv);
+    int result = suri_handle_inspect_result(req, rv);
+    if (result == CI_MOD_CONTINUE) {
+        result = CI_MOD_DONE;
+    }
+    return result;
 }
 
 int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req)
@@ -1667,7 +1702,8 @@ out:
     // Silence the warning: label followed by a declaration is a C23 extension
     ;
     int result = suri_handle_inspect_result(req, rv);
-    if (result == CI_MOD_DONE && (rv == 0 || rv == -2)) {
+    // CI_OK == CI_MOD_DONE, but we fix it for correctness
+    if (result == CI_MOD_CONTINUE || result == CI_MOD_DONE) {
         return CI_OK;
     }
     return result;
