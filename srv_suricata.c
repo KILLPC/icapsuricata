@@ -135,6 +135,8 @@ enum suri_conn_state {
 
 // Per-request data structure
 struct suri_ctx {
+    ci_request_t *req;               /* needed to access req->connection->service_data in suri_release_request_data() */
+
     dual_ring_buf_t *body_buf;       /* accumulation buffer */
     unsigned int injected_since_ack; /* bytes injected to Suricata since last ACK */
 
@@ -164,6 +166,11 @@ struct suri_ctx {
     enum suri_conn_state state;
 
     // __suseconds_t tv_usec;
+};
+
+struct suri_conn_ctx {
+    uint32_t client_seq;
+    uint32_t server_seq;
 };
 
 enum suri_mode {mode_disallow204, mode_allow204};
@@ -1166,16 +1173,35 @@ void *suri_init_request_data(ci_request_t *req)
         return NULL;
     }
 
-    struct suri_ctx *ctx = calloc(1, sizeof(*ctx));
+    struct suri_ctx *ctx = malloc(sizeof(struct suri_ctx));
     if (!ctx) {
-        suri_log(1, "calloc failed for request data\n");
+        suri_log(1, "malloc failed for request data\n");
         return NULL;
+    }
+    memset(ctx, 0, sizeof(struct suri_ctx));
+
+    ctx->req = req;
+
+    if (req->type == ICAP_REQMOD) {
+        if (req->connection->service_data) {
+            free(req->connection->service_data);
+        }
+
+        req->connection->service_data = malloc(sizeof(struct suri_conn_ctx));
+        if (!req->connection->service_data) {
+            suri_log(1, "malloc failed for conn service_data\n");
+            free(ctx);
+            return NULL;
+        }
+        memset(req->connection->service_data, 0, sizeof(struct suri_conn_ctx));
+        suri_log(9, "Create conn service_data\n");
     }
 
     if (ci_req_hasbody(req)) {
         ctx->body_buf = dual_ring_buf_create(SURI_BUFSIZE);
         if (!ctx->body_buf) {
             suri_log(1, "body_buf init failed\n");
+            free(req->connection->service_data);
             free(ctx);
             return NULL;
         }
@@ -1192,6 +1218,14 @@ void suri_release_request_data(void *data)
     if (!ctx)
         return;
 
+    if (ctx->req && ctx->req->type == ICAP_RESPMOD) {
+        if (ctx->req->connection && ctx->req->connection->service_data) {
+            free(ctx->req->connection->service_data);
+            ctx->req->connection->service_data = NULL;
+            suri_log(9, "Destroy conn service_data\n");
+        }
+    }
+
     suri_log(5, "cap=%zu, client_len=%zu, suri_len=%zu\n",
         ctx->body_buf ? ctx->body_buf->capacity : 0,
         ctx->body_buf ? dual_ring_buf_client_read_available(ctx->body_buf) : 0,
@@ -1203,53 +1237,20 @@ void suri_release_request_data(void *data)
     free(ctx);
 }
 
-static int suri_get_response_vars(ci_request_t *req)
+static int suri_get_conn_seq_nums(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
 
-    const char *vars = ci_icap_request_get_header(req, "X-Response-Vars");
-    if (vars == NULL) {
-        suri_log(7, "No X-Response-Vars\n");
+    if (!req->connection->service_data) {
+        suri_log(1, "Connection service_data is NULL\n");
         return 1;
     }
 
-    char *v = strdup(vars);
-    if (!v) {
-        suri_log(1, "strdup for X-Response-Vars failed\n");
-        return -1;
-    }
+    struct suri_conn_ctx *conn_ctx = req->connection->service_data;
 
-    int rv = 0;
-    char *comma = strchr(v, ',');
-    if (comma) {
-        comma[0] = '\0';
-
-        char *endptr;
-        unsigned long val = strtoul(v, &endptr, 10);
-        if (endptr != v && *endptr == '\0' && val < 4294967296) {
-            ctx->client_seq = val;
-        }
-        else {
-            suri_log(7, "Invalid X-Response-Vars format %s\n", vars);
-            rv = 1;
-        }
-
-        val = strtoul(comma + 1, &endptr, 10);
-        if (endptr != comma + 1 && *endptr == '\0' && val < 4294967296) {
-            ctx->server_seq = val;
-        }
-        else {
-            suri_log(7, "Invalid X-Response-Vars format %s\n", vars);
-            rv = 1;
-        }
-    }
-    else {
-        suri_log(7, "Invalid X-Response-Vars format %s\n", vars);
-        rv = 1;
-    }
-
-    free(v);
-    return rv;
+    ctx->client_seq = conn_ctx->client_seq;
+    ctx->server_seq = conn_ctx->server_seq;
+    return 0;
 }
 
 static void suri_init_tcp_session(struct suri_ctx *ctx)
@@ -1299,13 +1300,10 @@ static int suri_set_seq_numbers(ci_request_t *req)
         // For response, we assume the connection is already established
         ctx->state = ESTABLISHED;
 
-        int result = 0;
-        if ((result = suri_get_response_vars(req)) == -1) {
-            return -1;
-        } else if (result == 1) {
-            suri_log(7, "No or invalid X-Response-Vars, using random seq nums\n");
+        if (suri_get_conn_seq_nums(req) == 1) {
+            suri_log(7, "No conn seq nums, using random seq nums\n");
             // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
-            // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
+            // but we will continue with these defaults if conn seq nums are not provided
             suri_init_tcp_session(ctx);
         }
 
@@ -1365,27 +1363,20 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             suri_log(5, "X-Response-Info already set to continue\n");
         }
 
-        // Seq numbers are passed from reqmod to respmod, do not send them in respmod
+        // Seq numbers are passed from reqmod to respmod, do not save them in respmod
         if (req->type == ICAP_RESPMOD) {
             break;
         }
 
-        if (req->xheaders) {
-            const char *current_resp_vars = ci_headers_value(req->xheaders, "X-Response-Vars");
-            if (current_resp_vars) {
-                suri_log(5, "X-Response-Vars already set to %s, removing\n", current_resp_vars);
-                ci_headers_remove(req->xheaders, "X-Response-Vars");
-            }
-        }
-
-        char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
-            suri_log(7, "Injecting: %s\n", resp_vars);
-            ci_icap_add_xheader(req, resp_vars);
+        struct suri_conn_ctx *conn_ctx = req->connection->service_data;
+        if (conn_ctx) {
+            suri_log(7, "Store seq nums: %u,%u\n", ctx->client_seq, ctx->server_seq);
+            conn_ctx->client_seq = ctx->client_seq;
+            conn_ctx->server_seq = ctx->server_seq;
             break;
         }
 
-        suri_log(1, "snprintf failed\n");
+        suri_log(1, "No connection context found\n");
         // fall through to error handling
     case -1:
         suri_log(1, "InjectPacket failed\n");

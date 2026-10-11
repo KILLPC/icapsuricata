@@ -32,12 +32,6 @@ It uses this network context when constructing emulated packets to be injected i
 X-Response-Info: blocked
 ```
 
-It also expects icap clients to echo back the `X-Response-Vars` header it injects into its responses to clients. `icapsuricata` uses the values in `X-Response-Vars` internally, to initialize client and server sequence numbers when injecting emulated packets into Suricata in RESPMOD.
-
-```text
-X-Response-Vars: 3493600807,3338221217
-```
-
 ### Protocol Support
 
 Currently, `icapsuricata` assumes the protocol is `tcp` unless the `X-Proto` header contains `udp` (this requirement may change in the future as new protocol support are added). Depending on the protocol, SSLproxy sends `http`, `https`, `http2`, or `http3` in the `X-Proto` header.
@@ -95,6 +89,22 @@ sudo apt install c-icap libicapapi-dev
 # or build from source
 git clone https://github.com/c-icap/c-icap-server.git
 cd c-icap-server && sh RECONF && ./configure && make && sudo make install
+```
+
+When injecting emulated packets into Suricata in RESPMOD, `icapsuricata` retreives the final client and server sequence numbers in REQMOD from a connection-level storage in `c-icap`. This feature requires a patch to `c-icap`:
+
+```diff
+--- c-icap-server/include/net_io.h.orig
++++ c-icap-server/include/net_io.h
+@@ -126,6 +126,7 @@ struct ci_connection {
+     ci_tls_conn_pcontext_t tls_conn_pcontext;
+ #endif
+     int32_t flags;
++    void *service_data;
+ };
+ 
+ struct ci_port;
+
 ```
 
 ### 2 · libsuricata
@@ -189,7 +199,7 @@ icap://<host>:1344/suricata
 For example, you can use the following ICAP specification in SSLproxy:
 
 ```text
-Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,16384,yes,no,X-Response-Vars
+Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,16384,yes,no
 ```
 See the [icap branch](https://github.com/sonertari/SSLproxy/tree/icap) in the SSLproxy project for details.
 
