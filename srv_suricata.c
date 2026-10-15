@@ -372,6 +372,9 @@ static void suri_free_tv(ThreadVars *tv)
     /* Flush local counters to global stats */
     StatsSyncCounters(tv);
 
+    // ATTENTION: We must clean up the stats, otherwise StatsMgmtThread StatsOutput() crashes with SIGABRT and SIGSEGV.
+    StatsThreadCleanup(tv);
+
     /* Run thread slot deinitialization (frees detection engine contexts, 
        thread-local caches, packet pools) without touching flow loops */
     PacketPoolDestroy();
@@ -1069,6 +1072,23 @@ void suri_close_service(void)
         //     SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
         // }
 
+        // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
+        suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
+        suri_free_tv(g_worker_tv);
+        g_worker_tv = NULL;
+
+        // Clean up and UNLINK all lazy TVs
+        pthread_mutex_lock(&g_lazy_tv_lock);
+        for (int i = 0; i < g_lazy_tv_count; i++) {
+            if (g_lazy_tvs[i] != NULL) {
+                suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
+                suri_free_tv(g_lazy_tvs[i]);
+                g_lazy_tvs[i] = NULL;
+            }
+        }
+        g_lazy_tv_count = 0;
+        pthread_mutex_unlock(&g_lazy_tv_lock);
+
         /* Structure for dynamic thread collection */
         struct suri_thread_node {
             pthread_t t;
@@ -1106,6 +1126,10 @@ void suri_close_service(void)
                         SCCtrlMutexUnlock(tv->ctrl_mutex);
                     }
                 }
+                else {
+                    suri_log(7, "Child skipping collection of (no thread) thread [%s, %d, %d] (ID: %lu)\n",
+                        tv->name, tv->id, tv->type, (unsigned long)tv->t);
+                }
                 tv = tv->next;
             }
         }
@@ -1137,23 +1161,6 @@ void suri_close_service(void)
         // The pthread_join here ensures the worker has finished before we return.
         suri_log(7, "Child joining worker thread, g_worker_thread_id=%llu, tid=%d\n", (unsigned long long)g_worker_thread_id, tid);
         pthread_join(g_worker_thread_id, NULL);
-
-        // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
-        suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
-        suri_free_tv(g_worker_tv);
-        g_worker_tv = NULL;
-
-        // Clean up and UNLINK all lazy TVs
-        pthread_mutex_lock(&g_lazy_tv_lock);
-        for (int i = 0; i < g_lazy_tv_count; i++) {
-            if (g_lazy_tvs[i] != NULL) {
-                suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
-                suri_free_tv(g_lazy_tvs[i]);
-                g_lazy_tvs[i] = NULL;
-            }
-        }
-        g_lazy_tv_count = 0;
-        pthread_mutex_unlock(&g_lazy_tv_lock);
 
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
