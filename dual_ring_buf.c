@@ -48,6 +48,7 @@ dual_ring_buf_t *dual_ring_buf_create(size_t capacity) {
 void dual_ring_buf_destroy(dual_ring_buf_t *rb) {
     if (rb) {
         free(rb->buffer);
+        rb->buffer = NULL;
         free(rb);
     }
 }

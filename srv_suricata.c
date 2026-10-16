@@ -788,6 +788,9 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
     return pkt;
 }
 
+/* Per-child process mutex for live device */
+static pthread_mutex_t g_live_device_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // InjectPacket — wrap raw bytes in a minimal Suricata Packet and push
 // it through the detection engine.
 // We present the payload as a raw segment on a fake loopback device.
@@ -807,8 +810,12 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
         return -1;
     }
 
+    // Critical section starts: Serialize access to the live device
+    pthread_mutex_lock(&g_live_device_mutex);
+
     if (GetLiveDevice(req) == NULL) {
         free(pkt);
+        pthread_mutex_unlock(&g_live_device_mutex);
         return -1;
     }
 
@@ -816,6 +823,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     if (unlikely(p == NULL)) {
         suri_log(1, "PacketGetFromQueueOrAlloc failed\n");
         free(pkt);
+        pthread_mutex_unlock(&g_live_device_mutex);
         return -1;
     }
 
@@ -824,6 +832,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
         suri_log(1, "PacketSetData failed\n");
         free(pkt);
         TmqhOutputPacketpool(my_tv, p);
+        pthread_mutex_unlock(&g_live_device_mutex);
         return -1;
     }
 
@@ -853,10 +862,20 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     SCPacketSetLiveDevice(p, GetLiveDevice(req));
     SCPacketSetReleasePacket(p, ReleasePacket);
 
+    // Increment shared LiveDevice counters inside the mutex
+    LiveDevicePktsIncr(GetLiveDevice(req));
+
+    pthread_mutex_unlock(&g_live_device_mutex);
+    // Critical section ends
+
     // Use threadvars variable isolated strictly to this execution thread context
     if (TmThreadsSlotProcessPkt(my_tv, my_tv->tm_slots, p) != TM_ECODE_OK) {
         suri_log(1, "TmThreadsSlotProcessPkt failed\n");
+
+        // Recycle packet safely back to pool under mutex
+        pthread_mutex_lock(&g_live_device_mutex);
         TmqhOutputPacketpool(my_tv, p);
+        pthread_mutex_unlock(&g_live_device_mutex);
         return -1;
     }
 
@@ -868,8 +887,6 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
             PacketDropReasonToString(p->drop_reason));
         rv = 1;
     }
-
-    LiveDevicePktsIncr(GetLiveDevice(req));
 
     // ATTENTION: Do not recycle the packet with thread-local TVs, it will be handled by the Suricata engine
     // TmqhOutputPacketpool(my_tv, p);
@@ -1173,7 +1190,7 @@ void suri_close_service(void)
 
 void *suri_init_request_data(ci_request_t *req)
 {
-    suri_log(1, "ENTER\n");
+    suri_log(5, "ENTER\n");
 
     if (!g_suri_ready) {
         suri_log(1, "Suricata not initialized (PID: %d)\n", getpid());
@@ -1190,6 +1207,7 @@ void *suri_init_request_data(ci_request_t *req)
     ctx->req = req;
 
     if (req->type == ICAP_REQMOD) {
+        suri_log(7, "Create conn service_data\n");
         if (req->connection->service_data) {
             free(req->connection->service_data);
         }
@@ -1201,17 +1219,18 @@ void *suri_init_request_data(ci_request_t *req)
             return NULL;
         }
         memset(req->connection->service_data, 0, sizeof(struct suri_conn_ctx));
-        suri_log(9, "Create conn service_data\n");
     }
 
-    if (ci_req_hasbody(req)) {
-        ctx->body_buf = dual_ring_buf_create(SURI_BUFSIZE);
-        if (!ctx->body_buf) {
-            suri_log(1, "body_buf init failed\n");
+    suri_log(7, "Create dual ring buf\n");
+    ctx->body_buf = dual_ring_buf_create(SURI_BUFSIZE);
+    if (!ctx->body_buf) {
+        suri_log(1, "body_buf init failed\n");
+        if (req->connection->service_data) {
             free(req->connection->service_data);
-            free(ctx);
-            return NULL;
+            req->connection->service_data = NULL;
         }
+        free(ctx);
+        return NULL;
     }
 
     return ctx;
@@ -1227,19 +1246,19 @@ void suri_release_request_data(void *data)
 
     if (ctx->req && ctx->req->type == ICAP_RESPMOD) {
         if (ctx->req->connection && ctx->req->connection->service_data) {
+            suri_log(7, "Destroy conn service_data\n");
             free(ctx->req->connection->service_data);
             ctx->req->connection->service_data = NULL;
-            suri_log(9, "Destroy conn service_data\n");
         }
     }
 
-    suri_log(5, "cap=%zu, client_len=%zu, suri_len=%zu\n",
-        ctx->body_buf ? ctx->body_buf->capacity : 0,
-        ctx->body_buf ? dual_ring_buf_client_read_available(ctx->body_buf) : 0,
-        ctx->body_buf ? dual_ring_buf_suri_read_available(ctx->body_buf) : 0);
-
     if (ctx->body_buf) {
+        suri_log(7, "Destroy dual ring buf, cap=%zu, client_len=%zu, suri_len=%zu\n",
+            ctx->body_buf->capacity,
+            dual_ring_buf_client_read_available(ctx->body_buf),
+            dual_ring_buf_suri_read_available(ctx->body_buf));
         dual_ring_buf_destroy(ctx->body_buf);
+        ctx->body_buf = NULL;
     }
     free(ctx);
 }
