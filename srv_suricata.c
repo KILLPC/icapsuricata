@@ -57,7 +57,6 @@
 #include <c_icap/header.h>
 #include <c_icap/body.h>
 #include <c_icap/simple_api.h>
-#include <c_icap/debug.h>
 #include <c_icap/cfg_param.h>
 #include <c_icap/commands.h>
 
@@ -95,13 +94,14 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include "srv_suricata.h"
 #include "dual_ring_buf.h"
+#include "conn_table.h"
 
 #define SURI_BODY_BUF_SIZE (64 * 1024)  /* 64 KiB */
 #define SURI_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
 
-#define suri_log(LEVEL, format_str, ...) \
-    ci_debug_printf(LEVEL, "srv_suricata: %s: " format_str, __FUNCTION__, ##__VA_ARGS__)
+#define equal(s1, s2) (strlen((s1)) == strlen((s2)) && !strcmp((s1), (s2)))
 
 // Thread-local variables: one ThreadVars per c-icap worker thread, no mutex needed.
 static pthread_key_t g_worker_tv_key;
@@ -135,8 +135,6 @@ enum suri_conn_state {
 
 // Per-request data structure
 struct suri_ctx {
-    ci_request_t *req;               /* needed to access req->connection->service_data in suri_release_request_data() */
-
     dual_ring_buf_t *body_buf;       /* accumulation buffer */
     unsigned int injected_since_ack; /* bytes injected to Suricata since last ACK */
 
@@ -154,8 +152,12 @@ struct suri_ctx {
     unsigned int server_ip_set : 1;
     uint16_t server_port;
     unsigned int server_port_set : 1;
+    uint64_t stream_id;
+    unsigned int stream_id_set : 1;
     uint8_t  proto;
     unsigned int proto_set : 1;
+    uint8_t  proto_key;
+    unsigned int proto_key_set : 1;
     LiveDevice *dev;
     unsigned int dev_set : 1;
 
@@ -164,6 +166,9 @@ struct suri_ctx {
     uint32_t server_seq;
     uint32_t server_ack;
     enum suri_conn_state state;
+
+    struct suri_conn_key key;
+    unsigned int key_set : 1;
 
     // __suseconds_t tv_usec;
 };
@@ -595,6 +600,26 @@ static uint32_t GetServerPort(ci_request_t *req)
     return ctx->server_port;
 }
 
+static uint64_t GetStreamID(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+
+    if (ctx->stream_id_set) {
+        return ctx->stream_id;
+    }
+
+    ctx->stream_id = 0;  /* Fallback to 0 */
+    ctx->stream_id_set = 1;
+
+    const char *stream_id_str = ci_icap_request_get_header(req, "X-Stream-ID");
+    if (stream_id_str) {
+        ctx->stream_id = (uint64_t)strtoull(stream_id_str, NULL, 10);
+    }
+
+    suri_log(9, "X-Stream-ID=%s\n", stream_id_str ? stream_id_str : "not set, using fallback");
+    return ctx->stream_id;
+}
+
 static uint8_t GetProto(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
@@ -613,6 +638,58 @@ static uint8_t GetProto(ci_request_t *req)
 
     suri_log(9, "X-Proto=%s\n", proto_str ? proto_str : "not set, using default TCP");
     return ctx->proto;
+}
+
+static uint8_t GetProtoKey(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+
+    if (ctx->proto_key_set) {
+        return ctx->proto_key;
+    }
+
+    ctx->proto_key = 0;     /* Default to TCP */
+    ctx->proto_key_set = 1;
+
+    const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
+    if (equal(proto_str, "https")) {
+        ctx->proto_key = 1;
+    }
+    else if (equal(proto_str, "http2")) {
+        ctx->proto_key = 2;
+    }
+    else if (equal(proto_str, "http3")) {
+        ctx->proto_key = 3;
+    }
+    else if (equal(proto_str, "http")) {
+        ctx->proto_key = 4;
+    }
+
+    suri_log(7, "X-Proto=%s, proto_key=%u\n", proto_str ? proto_str : "not set, using default TCP", ctx->proto_key  );
+    return ctx->proto_key;
+}
+
+static struct suri_conn_key GetConnKey(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+
+    if (ctx->key_set) {
+        return ctx->key;
+    }
+
+    ctx->key_set = 1;
+
+    memset(&ctx->key, 0, sizeof(struct suri_conn_key));
+
+    ctx->key.src_ip = GetClientIP(req);
+    ctx->key.dst_ip = GetServerIP(req);
+    ctx->key.src_port = GetClientPort(req);
+    ctx->key.dst_port = GetServerPort(req);
+    ctx->key.stream_id = GetStreamID(req);
+    ctx->key.proto = GetProtoKey(req);
+
+    suri_log(9, "Populated connection key\n");
+    return ctx->key;
 }
 
 static LiveDevice *GetLiveDevice(ci_request_t *req)
@@ -1027,6 +1104,8 @@ int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf
     // hence is called first during service init
     suri_cfg_set(srv_xdata);
 
+    suri_conn_table_init();
+
     // Register the start command handler with c-icap for child processes to init Suricata
     suri_log(5, "Register suri_child_start command\n");
     ci_command_register_action("suri_child_start", CI_CMD_CHILD_START, NULL, suri_child_start_cmd_cb);
@@ -1054,6 +1133,9 @@ void suri_close_service(void)
         // ATTENTION: We don't call GlobalsDestroy() for parent, as parent does not call SuricataInit().
         // suri_log(7, "GlobalsDestroy()\n");
         // GlobalsDestroy();
+
+        suri_log(7, "Parent destroying global connection table\n");
+        suri_conn_table_destroy();
 
         suri_log(5, "Parent shutdown complete, current_pid=%d\n", current_pid);
 
@@ -1204,31 +1286,10 @@ void *suri_init_request_data(ci_request_t *req)
     }
     memset(ctx, 0, sizeof(struct suri_ctx));
 
-    ctx->req = req;
-
-    if (req->type == ICAP_REQMOD) {
-        suri_log(7, "Create conn service_data\n");
-        if (req->connection->service_data) {
-            free(req->connection->service_data);
-        }
-
-        req->connection->service_data = malloc(sizeof(struct suri_conn_ctx));
-        if (!req->connection->service_data) {
-            suri_log(1, "malloc failed for conn service_data\n");
-            free(ctx);
-            return NULL;
-        }
-        memset(req->connection->service_data, 0, sizeof(struct suri_conn_ctx));
-    }
-
     suri_log(7, "Create dual ring buf\n");
     ctx->body_buf = dual_ring_buf_create(SURI_BUFSIZE);
     if (!ctx->body_buf) {
         suri_log(1, "body_buf init failed\n");
-        if (req->connection->service_data) {
-            free(req->connection->service_data);
-            req->connection->service_data = NULL;
-        }
         free(ctx);
         return NULL;
     }
@@ -1244,14 +1305,6 @@ void suri_release_request_data(void *data)
     if (!ctx)
         return;
 
-    if (ctx->req && ctx->req->type == ICAP_RESPMOD) {
-        if (ctx->req->connection && ctx->req->connection->service_data) {
-            suri_log(7, "Destroy conn service_data\n");
-            free(ctx->req->connection->service_data);
-            ctx->req->connection->service_data = NULL;
-        }
-    }
-
     if (ctx->body_buf) {
         suri_log(7, "Destroy dual ring buf, cap=%zu, client_len=%zu, suri_len=%zu\n",
             ctx->body_buf->capacity,
@@ -1261,22 +1314,6 @@ void suri_release_request_data(void *data)
         ctx->body_buf = NULL;
     }
     free(ctx);
-}
-
-static int suri_get_conn_seq_nums(ci_request_t *req)
-{
-    struct suri_ctx *ctx = ci_service_data(req);
-
-    if (!req->connection->service_data) {
-        suri_log(1, "Connection service_data is NULL\n");
-        return 1;
-    }
-
-    struct suri_conn_ctx *conn_ctx = req->connection->service_data;
-
-    ctx->client_seq = conn_ctx->client_seq;
-    ctx->server_seq = conn_ctx->server_seq;
-    return 0;
 }
 
 static void suri_init_tcp_session(struct suri_ctx *ctx)
@@ -1326,7 +1363,14 @@ static int suri_set_seq_numbers(ci_request_t *req)
         // For response, we assume the connection is already established
         ctx->state = ESTABLISHED;
 
-        if (suri_get_conn_seq_nums(req) == 1) {
+        struct suri_conn_key key = GetConnKey(req);
+        if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port) == 1) {
+            ctx->icap_client_port_set = 1;
+
+            // Delete the connection key from the table immediately after retrieving its sequence numbers
+            suri_conn_table_delete(&key);
+        }
+        else {
             suri_log(7, "No conn seq nums, using random seq nums\n");
             // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
             // but we will continue with these defaults if conn seq nums are not provided
@@ -1337,7 +1381,7 @@ static int suri_set_seq_numbers(ci_request_t *req)
         ctx->server_ack = ctx->client_seq;
     }
 
-    suri_log(7, "Set client_seq=%u, server_seq=%u\n", ctx->client_seq, ctx->server_seq);
+    suri_log(7, "Set client_seq=%u, server_seq=%u, icap_client_port=%u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
     return 0;
 }
 
@@ -1394,16 +1438,10 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             break;
         }
 
-        struct suri_conn_ctx *conn_ctx = req->connection->service_data;
-        if (conn_ctx) {
-            suri_log(7, "Store seq nums: %u,%u\n", ctx->client_seq, ctx->server_seq);
-            conn_ctx->client_seq = ctx->client_seq;
-            conn_ctx->server_seq = ctx->server_seq;
-            break;
-        }
-
-        suri_log(1, "No connection context found\n");
-        // fall through to error handling
+        suri_log(7, "Save conn state, seq nums: %u, %u, icap_client_port: %u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
+        struct suri_conn_key key = GetConnKey(req);
+        suri_conn_table_set(&key, ctx->client_seq, ctx->server_seq, GetIcapClientPort(req));
+        break;
     case -1:
         suri_log(1, "InjectPacket failed\n");
         if (req->xheaders) {

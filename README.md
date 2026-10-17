@@ -22,9 +22,10 @@ The core challenge of running an interface-based packet inspection engine inside
 * `X-Client-Port`
 * `X-Server-IP`
 * `X-Server-Port`
+* `X-Stream-ID`
 * `X-Proto`
 
-It uses this network context when constructing emulated packets to be injected into Suricata.
+It uses this network context when constructing emulated packets to be injected into Suricata. `X-Stream-ID` is for the id number of HTTP/2 and HTTP/3 streams.
 
 `icapsuricata` returns the inspection result via the `X-Response-Info` header. For example:
 
@@ -44,7 +45,7 @@ Currently, `icapsuricata` assumes the protocol is `tcp` unless the `X-Proto` hea
 
 `icapsuricata` always uses the client port of the ICAP connection for that connection/stream as the client port in the emulated TCP packets injected into `Suricata`. This allows `Suricata` to distinguish different H2 and H3 streams, otherwise they all would have the same client port, which would confuse the flow tracking in `Suricata`. But, it also adds the actual client port in the `X-Client-Port` header to the emulated packet as the common TCP option kind `78`, so that standard packet dissecting layers can recognize and pull the actual client port in that TCP option.
 
-The goal is to add support for other protocols.
+The goal is to add support for other protocols too.
 
 ### Dual-Reader Circular Buffer (Zero Heap Churn)
 
@@ -57,6 +58,18 @@ To handle streaming payloads safely, the module manages memory via a high-perfor
 * **Reader 2 (Suricata Queue):** Accumulates data independently into optimal chunk boundaries (typically 4KB alignment) before staging it for packetization.
 
 * **Space Reclamation:** Memory allocations are circular and strictly bound. Space is infinitely recycled the millisecond *both* readers have successfully advanced past a given index, completely eliminating runtime memory fragmentation (`realloc` loops).
+
+### Concurrent Connection State Table (Cross-Request Session Tracking)
+
+To correlate `REQMOD` and `RESPMOD` phases reliably across multiplexed streams and non-persistent `c-icap` worker threads, the module maintains an in-memory, thread-safe hash table keyed by a synthetic 6-tuple.
+
+* **The 6-Tuple Key (`X-Proto` & `X-Stream-ID` Aware):** Combines the real network 4-tuple with protocol version (`tcp`, `http`, `https`, `http2`, and `http3`) and source stream ID (`int64_t`). This uniquely identifies individual HTTP/2 and HTTP/3 multiplexed streams sharing the same underlying TCP/QUIC connection.
+
+* **Fine-Grained Bucket Locking:** Uses a fixed array of 512 buckets, each protected by an independent `pthread_rwlock_t`. This allows multiple `c-icap` worker threads to perform concurrent lookups and updates with near-zero lock contention.
+
+* **Synthetic Port & Sequence Persistence:** Remembers the final `client_seq`, `server_seq`, and synthetic `icap_client_port` assigned during `REQMOD`. When `RESPMOD` arrives—even over a new socket or on a different child process—it restores these exact parameters, preserving Suricata's internal TCP flow state machine.
+
+* **Inline Stale Node Eviction (TTL-Based):** Entries store an access timestamp and are automatically purged during subsequent hash updates if they exceed the expiration threshold (60 seconds). This prevents memory leaks if an ICAP client drops a connection before issuing a `RESPMOD`.
 
 ### Low-Overhead Network Emulation Pipeline
 
@@ -89,22 +102,6 @@ sudo apt install c-icap libicapapi-dev
 # or build from source
 git clone https://github.com/c-icap/c-icap-server.git
 cd c-icap-server && sh RECONF && ./configure && make && sudo make install
-```
-
-When injecting emulated packets into Suricata in RESPMOD, `icapsuricata` retreives the final client and server sequence numbers in REQMOD from a connection-level storage in `c-icap`. This feature requires a patch to `c-icap`:
-
-```diff
---- c-icap-server/include/net_io.h.orig
-+++ c-icap-server/include/net_io.h
-@@ -126,6 +126,7 @@ struct ci_connection {
-     ci_tls_conn_pcontext_t tls_conn_pcontext;
- #endif
-     int32_t flags;
-+    void *service_data;
- };
- 
- struct ci_port;
-
 ```
 
 ### 2 · libsuricata

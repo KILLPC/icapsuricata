@@ -48,7 +48,7 @@ CUSTOMLDFLAGS := -shared \
 
 # ── Targets ──────────────────────────────────────────────────────────────────
 TARGET  := srv_suricata.so
-SRC     := srv_suricata.c dual_ring_buf.c
+SRC     := srv_suricata.c dual_ring_buf.c conn_table.c
 
 .PHONY: all clean install
 

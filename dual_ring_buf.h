@@ -19,7 +19,10 @@
  * 02110-1301, USA.
  */
 
- #include <stdio.h>
+#ifndef DUAL_RING_BUF_H
+#define DUAL_RING_BUF_H
+
+#include <stdio.h>
 
 typedef struct {
     char *buffer;
@@ -41,3 +44,5 @@ size_t dual_ring_buf_client_read(dual_ring_buf_t *rb, char *dst, size_t max_len)
 
 size_t dual_ring_buf_suri_read_available(dual_ring_buf_t *rb);
 size_t dual_ring_buf_suri_read(dual_ring_buf_t *rb, char *dst, size_t max_len);
+
+#endif /* DUAL_RING_BUF_H */
