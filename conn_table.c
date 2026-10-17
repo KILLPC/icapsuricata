@@ -59,6 +59,8 @@ static struct suri_conn_table g_conn_table;
 
 void suri_conn_table_init(void)
 {
+    suri_log(5, "Initialize connection table\n");
+
     for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
         pthread_rwlock_init(&g_conn_table.buckets[i].lock, NULL);
         g_conn_table.buckets[i].head = NULL;
@@ -67,6 +69,8 @@ void suri_conn_table_init(void)
 
 void suri_conn_table_destroy(void)
 {
+    suri_log(5, "Destroy connection table\n");
+
     for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
         struct suri_conn_bucket *b = &g_conn_table.buckets[i];
 
@@ -76,7 +80,8 @@ void suri_conn_table_destroy(void)
         struct suri_conn_node *curr = b->head;
         while (curr != NULL) {
             struct suri_conn_node *next = curr->next;
-            suri_log(7, "Destroy connection client seq: %u, server seq: %u, icap client port: %u\n",
+            // This should never happen
+            suri_log(1, "Destroy connection client seq: %u, server seq: %u, icap client port: %u\n",
                 curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
             free(curr);
             curr = next;
@@ -113,7 +118,8 @@ static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
 
 static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struct suri_conn_key *b)
 {
-    // Always memset a/b to 0 before comparison, as memcmp does not account for potential padding bytes in the struct.
+    // ATTENTION: Always memset a/b to 0 on initialization for comparison,
+    // as memcmp does not account for potential padding bytes in the struct.
     return (memcmp(a, b, sizeof(struct suri_conn_key)) == 0);
     // return (a->src_ip == b->src_ip &&
     //         a->dst_ip == b->dst_ip &&
@@ -123,7 +129,7 @@ static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struc
     //         a->proto == b->proto);
 }
 
-void suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, uint32_t server_seq, uint16_t icap_client_port)
+int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, uint32_t server_seq, uint16_t icap_client_port)
 {
     uint32_t idx = suri_6tuple_hash(key);
     struct suri_conn_bucket *b = &g_conn_table.buckets[idx];
@@ -161,7 +167,7 @@ void suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, u
             suri_log(7, "Update connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
             pthread_rwlock_unlock(&b->lock);
-            return;
+            return 0;
         }
 
         prev = curr;
@@ -173,26 +179,29 @@ void suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, u
 
     /* Key not found: insert new node */
     struct suri_conn_node *new_node = malloc(sizeof(struct suri_conn_node));
-    memset(new_node, 0, sizeof(struct suri_conn_node));
-    if (new_node) {
-        new_node->key = *key;
-        new_node->val.client_seq = client_seq;
-        new_node->val.server_seq = server_seq;
-        new_node->val.icap_client_port = icap_client_port;
-        new_node->val.last_seen = now;
-        new_node->next = b->head;
-        b->head = new_node;
+    if (!new_node) {
+        suri_log(1, "malloc failed for new connection node\n");
+        return -1;
     }
 
+    memset(new_node, 0, sizeof(struct suri_conn_node));
+
+    new_node->key = *key;
+    new_node->val.client_seq = client_seq;
+    new_node->val.server_seq = server_seq;
+    new_node->val.icap_client_port = icap_client_port;
+    new_node->val.last_seen = now;
+    new_node->next = b->head;
+    b->head = new_node;
+
     pthread_rwlock_unlock(&b->lock);
+    return 0;
 }
 
 int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, uint32_t *server_seq, uint16_t *icap_client_port)
 {
     uint32_t idx = suri_6tuple_hash(key);
     struct suri_conn_bucket *b = &g_conn_table.buckets[idx];
-
-    suri_log(9, "Get connection for key hash index: %u\n", idx);
 
     pthread_rwlock_rdlock(&b->lock);
 
@@ -205,9 +214,15 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
             if (now - curr->val.last_seen <= SURI_CONN_TTL_SEC) {
                 suri_log(7, "Get connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                     idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
-                if (client_seq) *client_seq = curr->val.client_seq;
-                if (server_seq) *server_seq = curr->val.server_seq;
-                if (icap_client_port) *icap_client_port = curr->val.icap_client_port;
+                if (client_seq) {
+                    *client_seq = curr->val.client_seq;
+                }
+                if (server_seq) {
+                    *server_seq = curr->val.server_seq;
+                }
+                if (icap_client_port) {
+                    *icap_client_port = curr->val.icap_client_port;
+                }
                 found = 1;
             }
             break;
@@ -232,6 +247,7 @@ void suri_conn_table_delete(const struct suri_conn_key *key)
 
     struct suri_conn_node *curr = b->head;
     struct suri_conn_node *prev = NULL;
+    int found = 0;
 
     while (curr) {
         if (suri_conn_key_equal(&curr->key, key)) {
@@ -243,10 +259,16 @@ void suri_conn_table_delete(const struct suri_conn_key *key)
                 b->head = curr->next;
             }
             free(curr);
+            found = 1;
             break;
         }
         prev = curr;
         curr = curr->next;
+    }
+
+    if (!found) {
+        // This should never happen
+        suri_log(3, "Cannot find connection to delete for key hash index: %u\n", idx);
     }
 
     pthread_rwlock_unlock(&b->lock);

@@ -673,7 +673,7 @@ static uint8_t GetProtoKey(ci_request_t *req)
         ctx->proto_key = 4;
     }
 
-    suri_log(7, "X-Proto=%s, proto_key=%u\n", proto_str ? proto_str : "not set, using default TCP", ctx->proto_key  );
+    suri_log(9, "X-Proto=%s, proto_key=%u\n", proto_str ? proto_str : "not set, using default TCP", ctx->proto_key  );
     return ctx->proto_key;
 }
 
@@ -1142,7 +1142,6 @@ void suri_close_service(void)
         // suri_log(7, "GlobalsDestroy()\n");
         // GlobalsDestroy();
 
-        suri_log(7, "Parent destroying global connection table\n");
         suri_conn_table_destroy();
 
         suri_log(5, "Parent shutdown complete, current_pid=%d\n", current_pid);
@@ -1375,7 +1374,7 @@ static int suri_set_seq_numbers(ci_request_t *req)
         if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port) == 1) {
             ctx->icap_client_port_set = 1;
 
-            // Delete the connection key from the table immediately after retrieving its sequence numbers
+            // Delete the key from the table immediately after retrieving connection state
             suri_conn_table_delete(&key);
         }
         else {
@@ -1448,8 +1447,11 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
 
         suri_log(7, "Save conn state, seq nums: %u, %u, icap_client_port: %u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
         struct suri_conn_key key = GetConnKey(req);
-        suri_conn_table_set(&key, ctx->client_seq, ctx->server_seq, GetIcapClientPort(req));
-        break;
+        if (suri_conn_table_set(&key, ctx->client_seq, ctx->server_seq, GetIcapClientPort(req)) == 0) {
+            break;
+        }
+        suri_log(1, "Failed to save connection state\n");
+        // fall through to error handling
     case -1:
         suri_log(1, "InjectPacket failed\n");
         if (req->xheaders) {
