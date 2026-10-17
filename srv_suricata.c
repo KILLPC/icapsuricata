@@ -325,6 +325,14 @@ static ThreadVars *GetThreadWorkerVars(void)
             return NULL;
         }
 
+        // ATTENTION: Never call StatsThreadCleanup() here, otherwise TmThreadsSlotProcessPkt() may crash in StatsIncr().
+        // StatsThreadCleanup(tv);
+
+        // ATTENTION: Disable perf stats collection, otherwise StatsMgmtThread may crash in StatsOutput().
+        // Suricata expects a static pool of threads in its global stats_table, but c-icap stops/starts threads dynamically.
+        // TODO: Remove this workaround after fixing libsuricata.
+        tv->perf_public_ctx.head = NULL;
+
         pthread_setspecific(g_worker_tv_key, tv);
 
         // Register in the global list so suri_close_service() can free
@@ -377,8 +385,8 @@ static void suri_free_tv(ThreadVars *tv)
     /* Flush local counters to global stats */
     StatsSyncCounters(tv);
 
-    // ATTENTION: We must clean up the stats, otherwise StatsMgmtThread StatsOutput() crashes with SIGABRT and SIGSEGV.
-    StatsThreadCleanup(tv);
+    // TODO: We must clean up the stats, otherwise StatsMgmtThread StatsOutput() crashes with SIGABRT and SIGSEGV?
+    // StatsThreadCleanup(tv);
 
     /* Run thread slot deinitialization (frees detection engine contexts, 
        thread-local caches, packet pools) without touching flow loops */
