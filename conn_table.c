@@ -118,15 +118,33 @@ static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
 
 static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struct suri_conn_key *b)
 {
-    // ATTENTION: Always memset a/b to 0 on initialization for comparison,
+    // ATTENTION: We don't use memcmp for comparison, as it requires the caller to always memset a/b to 0 on initialization for comparison,
     // as memcmp does not account for potential padding bytes in the struct.
-    return (memcmp(a, b, sizeof(struct suri_conn_key)) == 0);
+    // Plus, it may be less efficient than field-by-field comparison, as memcmp may unnecessarily compare from the first to the last byte, including padding bytes.
+    // return (memcmp(a, b, sizeof(struct suri_conn_key)) == 0);
+
+    // ATTENTION: We don't use a long chain of boolean && operators into a single condition, as explicit early-returns may be faster during linked-list node traversals.
+    // Plus, long chains of && operators may be harder to read and maintain.
     // return (a->src_ip == b->src_ip &&
     //         a->dst_ip == b->dst_ip &&
     //         a->src_port == b->src_port &&
     //         a->dst_port == b->dst_port &&
     //         a->stream_id == b->stream_id &&
     //         a->proto == b->proto);
+
+    /* 1. Stream ID & Source Port (Highest entropy across H1/H2/H3) */
+    if (a->stream_id != b->stream_id) return 0;
+    if (a->src_port  != b->src_port)  return 0;
+
+    /* 2. Source IP (High variance in multi-client production) */
+    if (a->src_ip    != b->src_ip)    return 0;
+
+    /* 3. Destination IP & Port (Moderate-to-low variance) */
+    if (a->dst_ip    != b->dst_ip)    return 0;
+    if (a->dst_port  != b->dst_port)  return 0;
+
+    /* 4. Protocol (Lowest entropy - usually H2 or H3) */
+    return (a->proto == b->proto);
 }
 
 int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, uint32_t server_seq, uint16_t icap_client_port)
@@ -184,6 +202,8 @@ int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, ui
         return -1;
     }
 
+    // We don't use memcmp for key comparison, so no need to zero out the struct for padding bytes; memset is just for safety.
+    // See suri_conn_key_equal() for the rationale behind not using memcmp for key comparison.
     memset(new_node, 0, sizeof(struct suri_conn_node));
 
     new_node->key = *key;
