@@ -122,6 +122,9 @@ static ThreadVars *g_lazy_tvs[SURI_MAX_LAZY_TVS];
 static int g_lazy_tv_count = 0;
 static pthread_mutex_t g_lazy_tv_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Store the original public head pointer across request cycles
+static __thread StatsCounter *g_lazy_tv_saved_public_head = NULL;
+
 static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
 static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
@@ -328,10 +331,10 @@ static ThreadVars *GetThreadWorkerVars(void)
         // ATTENTION: Never call StatsThreadCleanup() here, otherwise TmThreadsSlotProcessPkt() may crash in StatsIncr().
         // StatsThreadCleanup(tv);
 
-        // ATTENTION: Disable perf stats collection, otherwise StatsMgmtThread may crash in StatsOutput().
-        // Suricata expects a static pool of threads in its global stats_table, but c-icap stops/starts threads dynamically.
-        // TODO: Remove this workaround after fixing libsuricata.
-        tv->perf_public_ctx.head = NULL;
+        // ATTENTION: We used to disable perf stats collection, otherwise StatsMgmtThread may crash in StatsOutput(),
+        // because Suricata expects a static pool of threads in its global stats_table, but c-icap stops/starts threads dynamically.
+        // Now instead, we stash and restore perf_public_ctx.head to shield it from dynamic thread changes.
+        // tv->perf_public_ctx.head = NULL;
 
         pthread_setspecific(g_worker_tv_key, tv);
 
@@ -380,17 +383,27 @@ static void suri_free_tv(ThreadVars *tv)
 {
     if (tv == NULL) return;
 
-    TmSlot *s = tv->tm_slots;
+    /* Restore public head */
+    if (tv->perf_public_ctx.head == NULL && g_lazy_tv_saved_public_head != NULL) {
+        /* ATTENTION: Suricata does not expose stats_table_mutex to lock here,
+           so we atomically restore the public head before processing packets */
+        __atomic_store_n(&tv->perf_public_ctx.head, g_lazy_tv_saved_public_head, __ATOMIC_SEQ_CST);
+    }
 
-    /* Flush local counters to global stats */
+    /* Final counter sync: flush local counters to global stats */
     StatsSyncCounters(tv);
 
-    // TODO: We must clean up the stats, otherwise StatsMgmtThread StatsOutput() crashes with SIGABRT and SIGSEGV?
-    // StatsThreadCleanup(tv);
+    StatsThreadCleanup(tv);
+
+    if (tv->perf_public_ctx.head != NULL) {
+        __atomic_store_n(&tv->perf_public_ctx.head, NULL, __ATOMIC_SEQ_CST);
+    }
 
     /* Run thread slot deinitialization (frees detection engine contexts, 
        thread-local caches, packet pools) without touching flow loops */
     PacketPoolDestroy();
+
+    TmSlot *s = tv->tm_slots;
 
     for (TmSlot *slot = s; slot != NULL; slot = slot->slot_next) {
         if (slot->SlotThreadExitPrintStats != NULL) {
@@ -427,6 +440,9 @@ static void *SuricataWorkerThread(void *arg)
     (void)arg;
 
     suri_log(5, "ENTER, start main worker thread, g_worker_tv->id=%d\n", g_worker_tv->id);
+
+    // The bootstrap thread does not process any packets, so StatsOutput should skip it
+    __atomic_store_n(&g_worker_tv->perf_public_ctx.head, NULL, __ATOMIC_SEQ_CST);
 
     // g_worker_tv was created in SuricataRunModeSetup (during SuricataInit).
     // It is already registered in tv_root so TmThreadWaitOnThreadInit can find it.
@@ -1060,6 +1076,51 @@ static void suri_child_start_cmd_cb(const char *name, int type, void *data)
         exit(EXIT_FAILURE);
     }
 
+    // Disable periodic stats and eve-log stats output to prevent StatsOutput crashing child processes
+    SCConfSetFromString("stats.interval=999999999", 1);
+
+    // TODO: These do not work
+    // SCConfSetFromString("outputs.0.eve-log.types.stats.threads=no", 1);
+    // SCConfSetFromString("outputs.0.eve-log.types.stats.deltas=no", 1);
+
+    SCConfNode *outputs = SCConfGetNode("outputs");
+    if (outputs != NULL) {
+        SCConfNode *output = NULL;
+        TAILQ_FOREACH(output, &outputs->head, next) {
+            SCConfNode *eve = SCConfNodeLookupChild(output, "eve-log");
+            if (eve != NULL) {
+                SCConfNode *types = SCConfNodeLookupChild(eve, "types");
+                if (types != NULL) {
+                    SCConfNode *types_child = NULL;
+                    TAILQ_FOREACH(types_child, &types->head, next) {
+                        /* Check if this sub-type is "stats" */
+                        SCConfNode *stats_node = SCConfNodeLookupChild(types_child, "stats");
+                        if (stats_node != NULL) {
+                            // ATTENTION: We cannot disable both totals and threads at the same time, so only disable threads here.
+                            // SCConfNode *totals = SCConfNodeLookupChild(stats_node, "totals");
+                            // if (totals != NULL) {
+                            //     if (totals->val) SCFree(totals->val);
+                            //     totals->val = SCStrdup("no");
+                            // }
+                            SCConfNode *threads = SCConfNodeLookupChild(stats_node, "threads");
+                            if (threads != NULL) {
+                                // ATTENTION: Make sure to free the orig val before overwriting it and strdup the new value.
+                                // Otherwise, memory leaks or crashes may occur.
+                                if (threads->val) SCFree(threads->val);
+                                threads->val = SCStrdup("no");
+                            }
+                            SCConfNode *deltas = SCConfNodeLookupChild(stats_node, "deltas");
+                            if (deltas != NULL) {
+                                if (deltas->val) SCFree(deltas->val);
+                                deltas->val = SCStrdup("no");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Set up a thread-local key configuration block before priming any threads
     if (pthread_key_create(&g_worker_tv_key, ThreadVarsDestroyCallback) != 0) {
         suri_log(1, "Critical Error: Failed to configure pthread TLS storage key variables.\n");
@@ -1142,6 +1203,7 @@ void suri_close_service(void)
         // suri_log(7, "GlobalsDestroy()\n");
         // GlobalsDestroy();
 
+        suri_log(5, "Parent destroying connection table, current_pid=%d\n", current_pid);
         suri_conn_table_destroy();
 
         suri_log(5, "Parent shutdown complete, current_pid=%d\n", current_pid);
@@ -1271,6 +1333,9 @@ void suri_close_service(void)
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
 
+        suri_log(5, "Child destroying connection table, current_pid=%d\n", current_pid);
+        suri_conn_table_destroy();
+
         suri_log(5, "Child shutdown complete, current_pid=%d\n", current_pid);
     } else {
         suri_log(7, "Child has no worker thread to join\n");
@@ -1301,6 +1366,14 @@ void *suri_init_request_data(ci_request_t *req)
         return NULL;
     }
 
+    ThreadVars *tv = GetThreadWorkerVars();
+    if (tv != NULL && tv->perf_public_ctx.head == NULL && g_lazy_tv_saved_public_head != NULL) {
+        /* Restore public head right before processing the new request */
+        /* ATTENTION: Suricata does not expose stats_table_mutex to lock here,
+           so we atomically restore the public head before processing packets */
+        __atomic_store_n(&tv->perf_public_ctx.head, g_lazy_tv_saved_public_head, __ATOMIC_SEQ_CST);
+    }
+
     return ctx;
 }
 
@@ -1320,6 +1393,23 @@ void suri_release_request_data(void *data)
         dual_ring_buf_destroy(ctx->body_buf);
         ctx->body_buf = NULL;
     }
+
+    ThreadVars *tv = GetThreadWorkerVars();
+    if (tv != NULL) {
+        /* Explicitly flush local private counters into public context at the end of EVERY request. */
+        StatsSyncCounters(tv);
+
+        /* Temporarily clear head so StatsOutput skips this TV during idle wait */
+        /* ATTENTION: Suricata does not expose stats_table_mutex to lock here,
+           so we atomically swap tv->perf_public_ctx.head to NULL */
+        StatsCounter *current_head = __atomic_exchange_n(&tv->perf_public_ctx.head, NULL, __ATOMIC_SEQ_CST);
+
+        /* Stash valid public head pointer before c-icap recycles entity pools */
+        if (current_head != NULL) {
+            g_lazy_tv_saved_public_head = current_head;
+        }
+    }
+
     free(ctx);
 }
 
