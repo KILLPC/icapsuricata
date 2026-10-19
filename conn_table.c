@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <pthread.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "srv_suricata.h"
 #include "conn_table.h"
@@ -31,7 +34,9 @@
 #include <netinet/in.h>
 
 #define SURI_CONN_HASH_BUCKETS 512  /* Power of 2 for fast masking */
+#define SURI_CONN_MAX_NODES    4096 /* Fixed preallocated node capacity in SHM */
 #define SURI_CONN_TTL_SEC       60  /* Expire unaccessed sessions after 60s */
+#define SURI_SHM_INVALID_IDX    -1
 
 struct suri_conn_val {
     uint32_t client_seq;
@@ -43,56 +48,137 @@ struct suri_conn_val {
 struct suri_conn_node {
     struct suri_conn_key key;
     struct suri_conn_val val;
-    struct suri_conn_node *next;
+    int32_t next_idx;           /* SHM offset index instead of virtual address pointer */
+    int in_use;
 };
 
 struct suri_conn_bucket {
-    pthread_rwlock_t lock;      /* Concurrent reads, exclusive writes per bucket */
-    struct suri_conn_node *head;
+    pthread_mutex_t lock;       /* Process-shared robust mutex */
+    int32_t head_idx;
 };
 
 struct suri_conn_table {
     struct suri_conn_bucket buckets[SURI_CONN_HASH_BUCKETS];
+    struct suri_conn_node   nodes[SURI_CONN_MAX_NODES];
+    pthread_mutex_t         pool_lock;  /* Protects free-list allocations */
+    int32_t                 free_head_idx;
 };
 
-static struct suri_conn_table g_conn_table;
+static struct suri_conn_table *g_shm_conn_table = NULL;
+
+/* Helper function to recover locks if a child process dies while holding a lock */
+static inline int suri_shm_lock(pthread_mutex_t *mtx)
+{
+    int rc = pthread_mutex_lock(mtx);
+    if (rc == EOWNERDEAD) {
+        suri_log(3, "Recovering robust mutex lock after child process termination\n");
+        pthread_mutex_consistent(mtx);
+        return 0;
+    }
+    return rc;
+}
+
+static inline void suri_shm_unlock(pthread_mutex_t *mtx)
+{
+    pthread_mutex_unlock(mtx);
+}
+
+/* SHM slot allocation helpers */
+static int32_t suri_shm_node_alloc(void)
+{
+    if (suri_shm_lock(&g_shm_conn_table->pool_lock) != 0) {
+        return SURI_SHM_INVALID_IDX;
+    }
+
+    int32_t idx = g_shm_conn_table->free_head_idx;
+    if (idx != SURI_SHM_INVALID_IDX) {
+        struct suri_conn_node *n = &g_shm_conn_table->nodes[idx];
+        g_shm_conn_table->free_head_idx = n->next_idx;
+        n->next_idx = SURI_SHM_INVALID_IDX;
+        n->in_use = 1;
+    } else {
+        suri_log(1, "SHM connection node pool exhausted! Increase SURI_CONN_MAX_NODES.\n");
+    }
+
+    suri_shm_unlock(&g_shm_conn_table->pool_lock);
+    return idx;
+}
+
+static void suri_shm_node_free(int32_t idx)
+{
+    if (idx < 0 || idx >= SURI_CONN_MAX_NODES) return;
+
+    if (suri_shm_lock(&g_shm_conn_table->pool_lock) != 0) {
+        return;
+    }
+
+    struct suri_conn_node *n = &g_shm_conn_table->nodes[idx];
+    memset(n, 0, sizeof(struct suri_conn_node));
+    n->next_idx = g_shm_conn_table->free_head_idx;
+    n->in_use = 0;
+    g_shm_conn_table->free_head_idx = idx;
+
+    suri_shm_unlock(&g_shm_conn_table->pool_lock);
+}
 
 void suri_conn_table_init(void)
 {
-    suri_log(5, "Initialize connection table\n");
+    suri_log(5, "Initialize shared-memory connection table\n");
 
-    for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
-        pthread_rwlock_init(&g_conn_table.buckets[i].lock, NULL);
-        g_conn_table.buckets[i].head = NULL;
+    size_t shm_size = sizeof(struct suri_conn_table);
+
+    /* Allocate process-shared anonymous memory prior to fork() */
+    g_shm_conn_table = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g_shm_conn_table == MAP_FAILED) {
+        suri_log(1, "mmap failed for shared-memory connection table\n");
+        g_shm_conn_table = NULL;
+        return;
     }
+
+    memset(g_shm_conn_table, 0, shm_size);
+
+    /* Setup robust, process-shared mutex attributes */
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+
+    /* Initialize bucket mutexes */
+    for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
+        pthread_mutex_init(&g_shm_conn_table->buckets[i].lock, &mattr);
+        g_shm_conn_table->buckets[i].head_idx = SURI_SHM_INVALID_IDX;
+    }
+
+    /* Initialize pool mutex */
+    pthread_mutex_init(&g_shm_conn_table->pool_lock, &mattr);
+    pthread_mutexattr_destroy(&mattr);
+
+    /* Link free nodes */
+    for (int i = 0; i < SURI_CONN_MAX_NODES; i++) {
+        g_shm_conn_table->nodes[i].next_idx = (i < SURI_CONN_MAX_NODES - 1) ? (i + 1) : SURI_SHM_INVALID_IDX;
+        g_shm_conn_table->nodes[i].in_use = 0;
+    }
+    g_shm_conn_table->free_head_idx = 0;
 }
 
 void suri_conn_table_destroy(void)
 {
-    suri_log(5, "Destroy connection table\n");
+    if (!g_shm_conn_table) return;
+
+    suri_log(5, "Destroy shared-memory connection table\n");
 
     for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
-        struct suri_conn_bucket *b = &g_conn_table.buckets[i];
-
-        /* Acquire write lock to prevent concurrent worker thread access during teardown */
-        pthread_rwlock_wrlock(&b->lock);
-
-        struct suri_conn_node *curr = b->head;
-        while (curr != NULL) {
-            struct suri_conn_node *next = curr->next;
-            // This should never happen
-            suri_log(1, "Destroy connection client seq: %u, server seq: %u, icap client port: %u\n",
-                curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
-            free(curr);
-            curr = next;
+        struct suri_conn_bucket *b = &g_shm_conn_table->buckets[i];
+        if (suri_shm_lock(&b->lock) == 0) {
+            b->head_idx = SURI_SHM_INVALID_IDX;
+            suri_shm_unlock(&b->lock);
         }
-
-        b->head = NULL;
-
-        /* Unlock before destroying the lock structure */
-        pthread_rwlock_unlock(&b->lock);
-        pthread_rwlock_destroy(&b->lock);
+        pthread_mutex_destroy(&b->lock);
     }
+
+    pthread_mutex_destroy(&g_shm_conn_table->pool_lock);
+    munmap(g_shm_conn_table, sizeof(struct suri_conn_table));
+    g_shm_conn_table = NULL;
 }
 
 static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
@@ -118,20 +204,6 @@ static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
 
 static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struct suri_conn_key *b)
 {
-    // ATTENTION: We don't use memcmp for comparison, as it requires the caller to always memset a/b to 0 on initialization for comparison,
-    // as memcmp does not account for potential padding bytes in the struct.
-    // Plus, it may be less efficient than field-by-field comparison, as memcmp may unnecessarily compare from the first to the last byte, including padding bytes.
-    // return (memcmp(a, b, sizeof(struct suri_conn_key)) == 0);
-
-    // ATTENTION: We don't use a long chain of boolean && operators into a single condition, as explicit early-returns may be faster during linked-list node traversals.
-    // Plus, long chains of && operators may be harder to read and maintain.
-    // return (a->src_ip == b->src_ip &&
-    //         a->dst_ip == b->dst_ip &&
-    //         a->src_port == b->src_port &&
-    //         a->dst_port == b->dst_port &&
-    //         a->stream_id == b->stream_id &&
-    //         a->proto == b->proto);
-
     /* 1. Stream ID & Source Port (Highest entropy across H1/H2/H3) */
     if (a->stream_id != b->stream_id) return 0;
     if (a->src_port  != b->src_port)  return 0;
@@ -149,29 +221,36 @@ static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struc
 
 int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, uint32_t server_seq, uint16_t icap_client_port)
 {
+    if (!g_shm_conn_table) return -1;
+
     uint32_t idx = suri_6tuple_hash(key);
-    struct suri_conn_bucket *b = &g_conn_table.buckets[idx];
+    struct suri_conn_bucket *b = &g_shm_conn_table->buckets[idx];
 
-    pthread_rwlock_wrlock(&b->lock);
+    if (suri_shm_lock(&b->lock) != 0) {
+        return -1;
+    }
 
-    struct suri_conn_node *curr = b->head;
-    struct suri_conn_node *prev = NULL;
+    int32_t curr_idx = b->head_idx;
+    int32_t prev_idx = SURI_SHM_INVALID_IDX;
     time_t now = time(NULL);
 
-    while (curr) {
+    while (curr_idx != SURI_SHM_INVALID_IDX) {
+        struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
+        int32_t next_idx = curr->next_idx;
+
         /* Purge expired node while iterating */
         if (now - curr->val.last_seen > SURI_CONN_TTL_SEC) {
-            struct suri_conn_node *stale = curr;
-            if (prev) {
-                prev->next = curr->next;
+            if (prev_idx != SURI_SHM_INVALID_IDX) {
+                g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;
             } else {
-                b->head = curr->next;
+                b->head_idx = next_idx;
             }
-            curr = curr->next;
 
             suri_log(7, "Purge stale connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
-                idx, stale->val.client_seq, stale->val.server_seq, ntohs(stale->val.icap_client_port));
-            free(stale);
+                idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
+
+            suri_shm_node_free(curr_idx);
+            curr_idx = next_idx;
             continue;
         }
 
@@ -184,52 +263,57 @@ int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, ui
 
             suri_log(7, "Update connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
-            pthread_rwlock_unlock(&b->lock);
+
+            suri_shm_unlock(&b->lock);
             return 0;
         }
 
-        prev = curr;
-        curr = curr->next;
+        prev_idx = curr_idx;
+        curr_idx = next_idx;
     }
 
     suri_log(7, "Set connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
         idx, client_seq, server_seq, ntohs(icap_client_port));
 
-    /* Key not found: insert new node */
-    struct suri_conn_node *new_node = malloc(sizeof(struct suri_conn_node));
-    if (!new_node) {
-        suri_log(1, "malloc failed for new connection node\n");
+    /* Key not found: allocate new node slot from SHM pool */
+    int32_t new_idx = suri_shm_node_alloc();
+    if (new_idx == SURI_SHM_INVALID_IDX) {
+        suri_log(1, "suri_shm_node_alloc failed for new connection node\n");
+        suri_shm_unlock(&b->lock);
         return -1;
     }
 
-    // We don't use memcmp for key comparison, so no need to zero out the struct for padding bytes; memset is just for safety.
-    // See suri_conn_key_equal() for the rationale behind not using memcmp for key comparison.
-    memset(new_node, 0, sizeof(struct suri_conn_node));
-
+    struct suri_conn_node *new_node = &g_shm_conn_table->nodes[new_idx];
     new_node->key = *key;
     new_node->val.client_seq = client_seq;
     new_node->val.server_seq = server_seq;
     new_node->val.icap_client_port = icap_client_port;
     new_node->val.last_seen = now;
-    new_node->next = b->head;
-    b->head = new_node;
+    new_node->next_idx = b->head_idx;
+    b->head_idx = new_idx;
 
-    pthread_rwlock_unlock(&b->lock);
+    suri_shm_unlock(&b->lock);
     return 0;
 }
 
 int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, uint32_t *server_seq, uint16_t *icap_client_port)
 {
+    if (!g_shm_conn_table) return 0;
+
     uint32_t idx = suri_6tuple_hash(key);
-    struct suri_conn_bucket *b = &g_conn_table.buckets[idx];
+    struct suri_conn_bucket *b = &g_shm_conn_table->buckets[idx];
 
-    pthread_rwlock_rdlock(&b->lock);
+    if (suri_shm_lock(&b->lock) != 0) {
+        return 0;
+    }
 
-    struct suri_conn_node *curr = b->head;
+    int32_t curr_idx = b->head_idx;
     time_t now = time(NULL);
     int found = 0;
 
-    while (curr) {
+    while (curr_idx != SURI_SHM_INVALID_IDX) {
+        struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
+
         if (suri_conn_key_equal(&curr->key, key)) {
             if (now - curr->val.last_seen <= SURI_CONN_TTL_SEC) {
                 suri_log(7, "Get connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
@@ -247,49 +331,57 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
             }
             break;
         }
-        curr = curr->next;
+        curr_idx = curr->next_idx;
     }
 
     if (!found) {
         suri_log(7, "Cannot find connection for key hash index: %u\n", idx);
     }
 
-    pthread_rwlock_unlock(&b->lock);
+    suri_shm_unlock(&b->lock);
     return found;
 }
 
 void suri_conn_table_delete(const struct suri_conn_key *key)
 {
+    if (!g_shm_conn_table) return;
+
     uint32_t idx = suri_6tuple_hash(key);
-    struct suri_conn_bucket *b = &g_conn_table.buckets[idx];
+    struct suri_conn_bucket *b = &g_shm_conn_table->buckets[idx];
 
-    pthread_rwlock_wrlock(&b->lock);
+    if (suri_shm_lock(&b->lock) != 0) {
+        return;
+    }
 
-    struct suri_conn_node *curr = b->head;
-    struct suri_conn_node *prev = NULL;
+    int32_t curr_idx = b->head_idx;
+    int32_t prev_idx = SURI_SHM_INVALID_IDX;
     int found = 0;
 
-    while (curr) {
+    while (curr_idx != SURI_SHM_INVALID_IDX) {
+        struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
+        int32_t next_idx = curr->next_idx;
+
         if (suri_conn_key_equal(&curr->key, key)) {
             suri_log(7, "Delete connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
-            if (prev) {
-                prev->next = curr->next;
+
+            if (prev_idx != SURI_SHM_INVALID_IDX) {
+                g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;
             } else {
-                b->head = curr->next;
+                b->head_idx = next_idx;
             }
-            free(curr);
+
+            suri_shm_node_free(curr_idx);
             found = 1;
             break;
         }
-        prev = curr;
-        curr = curr->next;
+        prev_idx = curr_idx;
+        curr_idx = next_idx;
     }
 
     if (!found) {
-        // This should never happen
         suri_log(3, "Cannot find connection to delete for key hash index: %u\n", idx);
     }
 
-    pthread_rwlock_unlock(&b->lock);
+    suri_shm_unlock(&b->lock);
 }

@@ -1333,9 +1333,6 @@ void suri_close_service(void)
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
 
-        suri_log(5, "Child destroying connection table, current_pid=%d\n", current_pid);
-        suri_conn_table_destroy();
-
         suri_log(5, "Child shutdown complete, current_pid=%d\n", current_pid);
     } else {
         suri_log(7, "Child has no worker thread to join\n");
