@@ -70,11 +70,15 @@ static struct suri_conn_table *g_shm_conn_table = NULL;
 static inline int suri_shm_lock(pthread_mutex_t *mtx)
 {
     int rc = pthread_mutex_lock(mtx);
+#if defined(PTHREAD_MUTEX_ROBUST) || defined(EOWNERDEAD)
     if (rc == EOWNERDEAD) {
         suri_log(3, "Recovering robust mutex lock after child process termination\n");
+#if defined(HAVE_PTHREAD_MUTEX_CONSISTENT) || defined(__GLIBC__) || defined(__linux__)
         pthread_mutex_consistent(mtx);
+#endif
         return 0;
     }
+#endif
     return rc;
 }
 
@@ -137,11 +141,17 @@ void suri_conn_table_init(void)
 
     memset(g_shm_conn_table, 0, shm_size);
 
-    /* Setup robust, process-shared mutex attributes */
+    /* Setup mutex attributes conditionally */
     pthread_mutexattr_t mattr;
     pthread_mutexattr_init(&mattr);
+
+#if defined(PTHREAD_PROCESS_SHARED) && !defined(__OpenBSD__)
     pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+#endif
+
+#if defined(PTHREAD_MUTEX_ROBUST) && !defined(__OpenBSD__)
     pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+#endif
 
     /* Initialize bucket mutexes */
     for (int i = 0; i < SURI_CONN_HASH_BUCKETS; i++) {
