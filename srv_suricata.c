@@ -1460,9 +1460,6 @@ static int suri_set_seq_numbers(ci_request_t *req)
         struct suri_conn_key key = GetConnKey(req);
         if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port) == 1) {
             ctx->icap_client_port_set = 1;
-
-            // Delete the key from the table immediately after retrieving connection state
-            suri_conn_table_delete(&key);
         }
         else {
             suri_log(7, "No conn seq nums, using random seq nums\n");

@@ -35,8 +35,8 @@
 
 #define SURI_CONN_HASH_BUCKETS 512  /* Power of 2 for fast masking */
 #define SURI_CONN_MAX_NODES    4096 /* Fixed preallocated node capacity in SHM */
-#define SURI_CONN_TTL_SEC       60  /* Expire unaccessed sessions after 60s */
-#define SURI_SHM_INVALID_IDX    -1
+#define SURI_CONN_TTL_SEC      300  /* Expire unaccessed sessions after 5 minutes */
+#define SURI_SHM_INVALID_IDX   -1
 
 struct suri_conn_val {
     uint32_t client_seq;
@@ -256,7 +256,7 @@ int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, ui
                 b->head_idx = next_idx;
             }
 
-            suri_log(7, "Purge stale connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
+            suri_log(7, "Purge stale connection during set for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
 
             suri_shm_node_free(curr_idx);
@@ -318,62 +318,22 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
     }
 
     int32_t curr_idx = b->head_idx;
-    time_t now = time(NULL);
-    int found = 0;
-
-    while (curr_idx != SURI_SHM_INVALID_IDX) {
-        struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
-
-        if (suri_conn_key_equal(&curr->key, key)) {
-            if (now - curr->val.last_seen <= SURI_CONN_TTL_SEC) {
-                suri_log(7, "Get connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
-                    idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
-                if (client_seq) {
-                    *client_seq = curr->val.client_seq;
-                }
-                if (server_seq) {
-                    *server_seq = curr->val.server_seq;
-                }
-                if (icap_client_port) {
-                    *icap_client_port = curr->val.icap_client_port;
-                }
-                found = 1;
-            }
-            break;
-        }
-        curr_idx = curr->next_idx;
-    }
-
-    if (!found) {
-        suri_log(7, "Cannot find connection for key hash index: %u\n", idx);
-    }
-
-    suri_shm_unlock(&b->lock);
-    return found;
-}
-
-void suri_conn_table_delete(const struct suri_conn_key *key)
-{
-    if (!g_shm_conn_table) return;
-
-    uint32_t idx = suri_6tuple_hash(key);
-    struct suri_conn_bucket *b = &g_shm_conn_table->buckets[idx];
-
-    if (suri_shm_lock(&b->lock) != 0) {
-        return;
-    }
-
-    int32_t curr_idx = b->head_idx;
     int32_t prev_idx = SURI_SHM_INVALID_IDX;
+    time_t now = time(NULL);
     int found = 0;
 
     while (curr_idx != SURI_SHM_INVALID_IDX) {
         struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
         int32_t next_idx = curr->next_idx;
 
+        /* 1. KEY MATCH (Even if expired - fetch and evict) */
         if (suri_conn_key_equal(&curr->key, key)) {
-            suri_log(7, "Delete connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
+            suri_log(7, "Get and delete connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
+
+            if (client_seq)       *client_seq = curr->val.client_seq;
+            if (server_seq)       *server_seq = curr->val.server_seq;
+            if (icap_client_port) *icap_client_port = curr->val.icap_client_port;
 
             if (prev_idx != SURI_SHM_INVALID_IDX) {
                 g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;
@@ -385,13 +345,32 @@ void suri_conn_table_delete(const struct suri_conn_key *key)
             found = 1;
             break;
         }
+
+        /* 2. INLINE PURGE (Only non-matching stale nodes) */
+        if (now - curr->val.last_seen > SURI_CONN_TTL_SEC) {
+            suri_log(7, "Purge stale connection during get for key hash index: %u\n", idx);
+
+            if (prev_idx != SURI_SHM_INVALID_IDX) {
+                g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;
+            } else {
+                b->head_idx = next_idx;
+            }
+
+            suri_shm_node_free(curr_idx);
+            curr_idx = next_idx;
+            /* ATTENTION: prev_idx remains unchanged because the node at curr_idx was removed! */
+            continue;
+        }
+
+        /* 3. ADVANCE POINTERS (Only reached for valid non-matching nodes) */
         prev_idx = curr_idx;
         curr_idx = next_idx;
     }
 
     if (!found) {
-        suri_log(3, "Cannot find connection to delete for key hash index: %u\n", idx);
+        suri_log(7, "Cannot find connection for key hash index: %u\n", idx);
     }
 
     suri_shm_unlock(&b->lock);
+    return found;
 }
