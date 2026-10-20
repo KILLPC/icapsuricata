@@ -326,27 +326,22 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
         struct suri_conn_node *curr = &g_shm_conn_table->nodes[curr_idx];
         int32_t next_idx = curr->next_idx;
 
-        /* 1. KEY MATCH (Even if expired - fetch and evict) */
+        /* 1. KEY MATCH: Return sequence state and refresh last_seen timestamp */
         if (suri_conn_key_equal(&curr->key, key)) {
-            suri_log(7, "Get and delete connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
+            curr->val.last_seen = now; /* Touch connection to reset TTL timer */
+
+            suri_log(7, "Get and touch connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
                 idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
 
             if (client_seq)       *client_seq = curr->val.client_seq;
             if (server_seq)       *server_seq = curr->val.server_seq;
             if (icap_client_port) *icap_client_port = curr->val.icap_client_port;
 
-            if (prev_idx != SURI_SHM_INVALID_IDX) {
-                g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;
-            } else {
-                b->head_idx = next_idx;
-            }
-
-            suri_shm_node_free(curr_idx);
             found = 1;
             break;
         }
 
-        /* 2. INLINE PURGE (Only non-matching stale nodes) */
+        /* 2. INLINE PURGE: Evict non-matching stale nodes encountered while traversing */
         if (now - curr->val.last_seen > SURI_CONN_TTL_SEC) {
             suri_log(7, "Purge stale connection during get for key hash index: %u\n", idx);
 
