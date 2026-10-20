@@ -33,8 +33,10 @@
 
 #include <netinet/in.h>
 
-#define SURI_CONN_HASH_BUCKETS 512  /* Power of 2 for fast masking */
-#define SURI_CONN_MAX_NODES    4096 /* Fixed preallocated node capacity in SHM */
+// With 2048 buckets and 8192 nodes, the load factor is 4.0.
+// A load factor between 1.0 and 5.0 is considered fine for chained hash tables.
+#define SURI_CONN_HASH_BUCKETS 2048 /* Power of 2 for fast masking */
+#define SURI_CONN_MAX_NODES    8192 /* Fixed preallocated node capacity in SHM */
 #define SURI_CONN_TTL_SEC      1800 /* Expire unaccessed sessions after 30 minutes */
 #define SURI_SHM_INVALID_IDX   -1
 
@@ -193,21 +195,25 @@ void suri_conn_table_destroy(void)
 
 static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
 {
-    /* Fold 64-bit stream_id into 32 bits */
+    /* 1. Fold 64-bit stream_id into 32 bits */
     uint32_t stream_mix = (uint32_t)(k->stream_id ^ (k->stream_id >> 32));
 
-    /* Combine IP addresses, ports, protocol, and stream ID */
-    uint32_t h = k->src_ip ^ k->dst_ip;
-    h ^= ((uint32_t)k->src_port << 16) | k->dst_port;
-    h ^= stream_mix;
-    h ^= (uint32_t)k->proto;
+    /* 2. Mix high-entropy fields first (Stream ID & Source Port) */
+    uint32_t h = stream_mix;
+    h = (h * 31) + (uint32_t)k->src_port;
 
-    /* Thomas Wang 32-bit integer mix */
-    h = (h ^ 61) ^ (h >> 16);
-    h = h + (h << 3);
-    h = h ^ (h >> 4);
-    h = h * 0x27d4eb2d;
-    h = h ^ (h >> 15);
+    /* 3. Add IP addresses and Destination Port */
+    h = (h * 31) + k->src_ip;
+    h = (h * 31) + k->dst_ip;
+    h = (h * 31) + (uint32_t)k->dst_port;
+    h = (h * 31) + (uint32_t)k->proto;
+
+    /* 4. MurmurHash3 32-bit finalizer (fmix32) for full avalanche effect */
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
 
     return h & (SURI_CONN_HASH_BUCKETS - 1);
 }
