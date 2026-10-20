@@ -334,6 +334,12 @@ static ThreadVars *GetThreadWorkerVars(void)
         // Now instead, we stash and restore perf_public_ctx.head to shield it from dynamic thread changes.
         // tv->perf_public_ctx.head = NULL;
 
+        // Bind Suricata's Thread-Local Storage (TLS) keys to the
+        // current c-icap POSIX thread. Without this, PoolThreadGetById() uses an
+        // uninitialized pthread_key_t handle (0xDFDFDFDF), causing a SIGSEGV
+        // in libc (_rthread_findstorage) during TCP stream reassembly, especially on OpenBSD.
+        TmThreadsRegisterThread(tv, tv->type);
+
         pthread_setspecific(g_worker_tv_key, tv);
 
         // Register in the global list so suri_close_service() can free
