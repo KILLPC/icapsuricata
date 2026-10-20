@@ -35,7 +35,7 @@
 
 #define SURI_CONN_HASH_BUCKETS 512  /* Power of 2 for fast masking */
 #define SURI_CONN_MAX_NODES    4096 /* Fixed preallocated node capacity in SHM */
-#define SURI_CONN_TTL_SEC      300  /* Expire unaccessed sessions after 5 minutes */
+#define SURI_CONN_TTL_SEC      1800 /* Expire unaccessed sessions after 30 minutes */
 #define SURI_SHM_INVALID_IDX   -1
 
 struct suri_conn_val {
