@@ -343,7 +343,8 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
 
         /* 2. INLINE PURGE: Evict non-matching stale nodes encountered while traversing */
         if (now - curr->val.last_seen > SURI_CONN_TTL_SEC) {
-            suri_log(7, "Purge stale connection during get for key hash index: %u\n", idx);
+            suri_log(7, "Purge stale connection during get for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
+                idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
 
             if (prev_idx != SURI_SHM_INVALID_IDX) {
                 g_shm_conn_table->nodes[prev_idx].next_idx = next_idx;

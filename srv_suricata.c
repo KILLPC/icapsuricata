@@ -161,8 +161,6 @@ struct suri_ctx {
     unsigned int proto_set : 1;
     uint8_t  proto_key;
     unsigned int proto_key_set : 1;
-    LiveDevice *dev;
-    unsigned int dev_set : 1;
 
     uint32_t client_seq;
     uint32_t client_ack;
@@ -716,27 +714,6 @@ static struct suri_conn_key GetConnKey(ci_request_t *req)
     return ctx->key;
 }
 
-static LiveDevice *GetLiveDevice(ci_request_t *req)
-{
-    struct suri_ctx *ctx = ci_service_data(req);
-
-    if (ctx->dev_set) {
-        return ctx->dev;
-    }
-
-    ctx->dev_set = 1;
-
-    ctx->dev = LiveGetDevice("suri_icap0");
-    if (ctx->dev == NULL) {
-        suri_log(1, "LiveGetDevice failed\n");
-    }
-    else {
-        suri_log(5, "Obtained LiveDevice for injection\n");
-    }
-
-    return ctx->dev;
-}
-
 static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
 {
     struct suri_ctx *ctx = ci_service_data(req);
@@ -911,15 +888,21 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
         return -1;
     }
 
-    // Critical section starts: Serialize access to the live device
+    /* START CRITICAL SECTION */
+    // Serialize access to the live device and packet pool allocation
     pthread_mutex_lock(&g_live_device_mutex);
 
-    if (GetLiveDevice(req) == NULL) {
+    LiveDevice *dev = LiveGetDevice("suri_icap0");
+    if (dev == NULL) {
+        suri_log(1, "LiveGetDevice failed\n");
         free(pkt);
         pthread_mutex_unlock(&g_live_device_mutex);
         return -1;
     }
 
+    suri_log(7, "Obtained LiveDevice for injection\n");
+
+    // Allocate Packet structure inside lock to prevent global PktPool race conditions
     Packet *p = PacketGetFromQueueOrAlloc();
     if (unlikely(p == NULL)) {
         suri_log(1, "PacketGetFromQueueOrAlloc failed\n");
@@ -928,7 +911,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
         return -1;
     }
 
-    // Hand over the synthesized buffer to the Suricata Packet allocation
+    // Hand over the synthesized raw buffer to the Suricata Packet allocation
     if (PacketSetData(p, pkt, pkt_len) == -1) {
         suri_log(1, "PacketSetData failed\n");
         free(pkt);
@@ -937,6 +920,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
         return -1;
     }
 
+    // Setup packet timestamp and metadata while locked
     // Timestamp — engine is in offline mode, so any value is fine.
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -960,14 +944,14 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     // ATTENTION: Suricata does NOT detect unless we ignore checksums
     p->flags |= PKT_IGNORE_CHECKSUM;
 
-    SCPacketSetLiveDevice(p, GetLiveDevice(req));
+    SCPacketSetLiveDevice(p, dev);
     SCPacketSetReleasePacket(p, ReleasePacket);
 
     // Increment shared LiveDevice counters inside the mutex
-    LiveDevicePktsIncr(GetLiveDevice(req));
+    LiveDevicePktsIncr(dev);
 
     pthread_mutex_unlock(&g_live_device_mutex);
-    // Critical section ends
+    /* END CRITICAL SECTION */
 
     // Use threadvars variable isolated strictly to this execution thread context
     if (TmThreadsSlotProcessPkt(my_tv, my_tv->tm_slots, p) != TM_ECODE_OK) {
