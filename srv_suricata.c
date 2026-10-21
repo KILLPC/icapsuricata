@@ -383,7 +383,7 @@ static void suri_unlink_tv_from_root(ThreadVars *tv_to_remove)
     }
 }
 
-static void suri_free_tv(ThreadVars *tv)
+static void suri_free_tv(ThreadVars *tv, int do_stats)
 {
     if (tv == NULL) return;
 
@@ -395,9 +395,10 @@ static void suri_free_tv(ThreadVars *tv)
     }
 
     /* Final counter sync: flush local counters to global stats */
-    StatsSyncCounters(tv);
-
-    StatsThreadCleanup(tv);
+    if (do_stats) {
+        StatsSyncCounters(tv);
+        StatsThreadCleanup(tv);
+    }
 
     if (tv->perf_public_ctx.head != NULL) {
         __atomic_store_n(&tv->perf_public_ctx.head, NULL, __ATOMIC_SEQ_CST);
@@ -494,7 +495,7 @@ static void *SuricataWorkerThread(void *arg)
     // ATTENTION: Do not free the bootstrap TV here, otherwise pthread_exit() may hang on OpenBSD.
     // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
     // suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
-    // suri_free_tv(g_worker_tv);
+    // suri_free_tv(g_worker_tv, 0);
     // g_worker_tv = NULL;
 
     suri_log(5, "EXIT\n");
@@ -1296,7 +1297,7 @@ void suri_close_service(void)
 
         // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
         suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
-        suri_free_tv(g_worker_tv);
+        suri_free_tv(g_worker_tv, 0);
         g_worker_tv = NULL;
 
         // Clean up and UNLINK all lazy TVs
@@ -1304,7 +1305,7 @@ void suri_close_service(void)
         for (int i = 0; i < g_lazy_tv_count; i++) {
             if (g_lazy_tvs[i] != NULL) {
                 suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
-                suri_free_tv(g_lazy_tvs[i]);
+                suri_free_tv(g_lazy_tvs[i], 1);
                 g_lazy_tvs[i] = NULL;
             }
         }
@@ -1444,17 +1445,19 @@ static int suri_set_seq_numbers(ci_request_t *req)
         suri_init_tcp_session(ctx);
     }
     else {
-        // For response, we assume the connection is already established
-        ctx->state = ESTABLISHED;
-
         struct suri_conn_key key = GetConnKey(req);
         if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port) == 1) {
             ctx->icap_client_port_set = 1;
+
+            // For response, we assume the connection is already established
+            ctx->state = ESTABLISHED;
         }
         else {
-            suri_log(7, "No conn seq nums, using random seq nums\n");
-            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
-            // but we will continue with these defaults if conn seq nums are not provided
+            suri_log(7, "No conn seq nums, use random seq nums, and emulate new flow\n");
+            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod,
+            // but we will continue with these defaults if conn seq nums are not provided,
+            // and emulate/inject a new TCP handshake and a dummy GET request packets into Suricata
+            // to create a new flow in Suricata's flow table.
             suri_init_tcp_session(ctx);
         }
 
@@ -1591,7 +1594,13 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         goto out;
     }
 
-    if (req->type == ICAP_REQMOD) {
+    int emulate_get_request = 0;
+
+    if (ctx->state == SYN) {
+        if (req->type == ICAP_RESPMOD) {
+            emulate_get_request = 1;
+        }
+
         // TCP handshake
         suri_log(7, "Inject SYN packet\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_SYN, 1)) != 0) {
@@ -1605,6 +1614,16 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 
         suri_log(7, "Inject ACK packet\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_ACK, 1)) != 0) {
+            goto out;
+        }
+    }
+
+    if (emulate_get_request) {
+        suri_log(5, "Injecting emulated GET request into Suricata\n");
+
+        // Emulate a dummy GET request to create a flow in Suricata
+        char *get_request = "GET / HTTP/1.1\r\nHost: icapsuricata\r\n\r\n";
+        if ((rv = InjectPacket(req, get_request, strlen(get_request), TH_PUSH|TH_ACK, 1)) != 0) {
             goto out;
         }
     }

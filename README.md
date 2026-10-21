@@ -65,7 +65,7 @@ To correlate `REQMOD` and `RESPMOD` phases reliably across multiplexed streams a
 
 * **The 6-Tuple Key (`X-Proto` & `X-Stream-ID` Aware):** Combines the real network 4-tuple with protocol version (`tcp`, `http`, `https`, `http2`, and `http3`) and source stream ID (`int64_t`). This uniquely identifies individual HTTP/2 and HTTP/3 multiplexed streams sharing the same underlying TCP/QUIC connection.
 
-* **Fine-Grained Bucket Locking:** Uses a fixed array of 512 buckets, each protected by an independent `pthread_rwlock_t`. This allows multiple `c-icap` worker threads to perform concurrent lookups and updates with near-zero lock contention.
+* **Fine-Grained Bucket Locking:** Uses a fixed array of 2048 buckets in shared memory, each protected by a process-shared `pthread_mutex_t`. This allows multiple `c-icap` worker threads running on multiple child processes to perform concurrent lookups and updates with near-zero lock contention.
 
 * **Synthetic Port & Sequence Persistence:** Remembers the final `client_seq`, `server_seq`, and synthetic `icap_client_port` assigned during `REQMOD`. When `RESPMOD` arrives—even over a new socket or on a different child process—it restores these exact parameters, preserving Suricata's internal TCP flow state machine.
 
