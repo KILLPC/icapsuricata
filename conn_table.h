@@ -23,10 +23,19 @@
 #define CONN_TABLE_H
 
 #include <stdint.h>
+#include <sys/socket.h>
+
+#define SURI_IP_ADDR_LEN 16
+
+/* Address storage is family-tagged and large enough for either address family. */
+struct suri_ip_addr {
+    uint8_t family;
+    uint8_t addr[SURI_IP_ADDR_LEN];
+};
 
 struct suri_conn_key {
-    uint32_t src_ip;
-    uint32_t dst_ip;
+    struct suri_ip_addr src_ip;
+    struct suri_ip_addr dst_ip;
     uint16_t src_port;
     uint16_t dst_port;
     uint64_t stream_id;   /* int64_t for H2/H3 stream IDs */

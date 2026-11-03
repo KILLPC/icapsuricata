@@ -202,9 +202,15 @@ static inline uint32_t suri_6tuple_hash(const struct suri_conn_key *k)
     uint32_t h = stream_mix;
     h = (h * 31) + (uint32_t)k->src_port;
 
-    /* 3. Add IP addresses and Destination Port */
-    h = (h * 31) + k->src_ip;
-    h = (h * 31) + k->dst_ip;
+    /* 3. Mix address family and all 128 bits of both addresses. */
+    h = (h * 31) + (uint32_t)k->src_ip.family;
+    for (size_t i = 0; i < SURI_IP_ADDR_LEN; i++) {
+        h = (h * 31) + k->src_ip.addr[i];
+    }
+    h = (h * 31) + (uint32_t)k->dst_ip.family;
+    for (size_t i = 0; i < SURI_IP_ADDR_LEN; i++) {
+        h = (h * 31) + k->dst_ip.addr[i];
+    }
     h = (h * 31) + (uint32_t)k->dst_port;
     h = (h * 31) + (uint32_t)k->proto;
 
@@ -224,11 +230,13 @@ static inline int suri_conn_key_equal(const struct suri_conn_key *a, const struc
     if (a->stream_id != b->stream_id) return 0;
     if (a->src_port  != b->src_port)  return 0;
 
-    /* 2. Source IP (High variance in multi-client production) */
-    if (a->src_ip    != b->src_ip)    return 0;
+    /* 2. Source and destination addresses (including address family). */
+    if (a->src_ip.family != b->src_ip.family ||
+        memcmp(a->src_ip.addr, b->src_ip.addr, SURI_IP_ADDR_LEN) != 0) return 0;
+    if (a->dst_ip.family != b->dst_ip.family ||
+        memcmp(a->dst_ip.addr, b->dst_ip.addr, SURI_IP_ADDR_LEN) != 0) return 0;
 
-    /* 3. Destination IP & Port (Moderate-to-low variance) */
-    if (a->dst_ip    != b->dst_ip)    return 0;
+    /* 3. Destination port (Moderate-to-low variance) */
     if (a->dst_port  != b->dst_port)  return 0;
 
     /* 4. Protocol (Lowest entropy - usually H2 or H3) */

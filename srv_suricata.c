@@ -91,7 +91,9 @@
 
 // For synthetic buffer construction
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <arpa/inet.h>
 
 #include "srv_suricata.h"
@@ -145,14 +147,14 @@ struct suri_ctx {
     unsigned int block : 1;
     unsigned int error : 1;
 
-    uint32_t client_ip;
-    unsigned int client_ip_set : 1;
+    struct suri_ip_addr client_ip;
+    struct suri_ip_addr server_ip;
+    unsigned int ip_addrs_set : 1;
+    unsigned int ip_addrs_valid : 1;
     uint16_t client_port;
     unsigned int client_port_set : 1;
     uint16_t icap_client_port;
     unsigned int icap_client_port_set : 1;
-    uint32_t server_ip;
-    unsigned int server_ip_set : 1;
     uint16_t server_port;
     unsigned int server_port_set : 1;
     uint64_t stream_id;
@@ -504,35 +506,92 @@ static void *SuricataWorkerThread(void *arg)
     pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
 }
 
-// Minimal 40-byte raw Layer 3 / Layer 4 structure 
-// packed to ensure precise network formatting alignment.
-struct __attribute__((__packed__)) fake_pkt_hdr {
-#ifdef __linux__
-    struct iphdr ip;
-#else
-    struct ip ip;
-#endif
-    struct tcphdr tcp;
-};
+/* Parse both endpoint addresses once so a packet can never mix address families. */
+static int ParseSuriIP(const char *ip_str, struct suri_ip_addr *addr)
+{
+    if (ip_str == NULL || addr == NULL) {
+        return 0;
+    }
 
-static uint32_t GetClientIP(ci_request_t *req)
+    memset(addr, 0, sizeof(*addr));
+    if (inet_pton(AF_INET, ip_str, addr->addr) == 1) {
+        addr->family = AF_INET;
+        return 1;
+    }
+    if (inet_pton(AF_INET6, ip_str, addr->addr) == 1) {
+        addr->family = AF_INET6;
+        return 1;
+    }
+    return -1;
+}
+
+static void SetLoopbackIP(struct suri_ip_addr *addr, uint8_t family)
+{
+    memset(addr, 0, sizeof(*addr));
+    addr->family = family;
+    if (family == AF_INET6) {
+        addr->addr[15] = 1;  /* ::1 */
+    } else {
+        addr->addr[0] = 127;
+        addr->addr[3] = 1;   /* 127.0.0.1 */
+    }
+}
+
+static int EnsureIPAddresses(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-
-    if (ctx->client_ip_set) {
-        return ctx->client_ip;
+    if (ctx->ip_addrs_set) {
+        return ctx->ip_addrs_valid ? 0 : -1;
     }
 
-    ctx->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-    ctx->client_ip_set = 1;
+    ctx->ip_addrs_set = 1;
+    ctx->ip_addrs_valid = 0;
 
-    const char *ip_str = ci_icap_request_get_header(req, "X-Client-IP");
-    if (ip_str) {
-        inet_pton(AF_INET, ip_str, &ctx->client_ip);
+    const char *client_str = ci_icap_request_get_header(req, "X-Client-IP");
+    const char *server_str = ci_icap_request_get_header(req, "X-Server-IP");
+    struct suri_ip_addr client_addr, server_addr;
+    int client_rc = ParseSuriIP(client_str, &client_addr);
+    int server_rc = ParseSuriIP(server_str, &server_addr);
+
+    if (client_rc < 0 || server_rc < 0) {
+        suri_log(1, "Invalid IP address header: X-Client-IP=%s, X-Server-IP=%s\n",
+                 client_str ? client_str : "(missing)", server_str ? server_str : "(missing)");
+        return -1;
     }
 
-    suri_log(9, "X-Client-IP=%s\n", ip_str ? ip_str : "not set, using fallback");
-    return ctx->client_ip;
+    if (client_rc == 1 && server_rc == 1 && client_addr.family != server_addr.family) {
+        suri_log(1, "Cannot synthesize a native IP packet with mixed address families: client=%s, server=%s\n",
+                 client_str, server_str);
+        return -1;
+    }
+
+    uint8_t family = client_rc == 1 ? client_addr.family :
+                     server_rc == 1 ? server_addr.family : AF_INET;
+
+    if (client_rc == 1) {
+        ctx->client_ip = client_addr;
+    } else {
+        SetLoopbackIP(&ctx->client_ip, family);
+    }
+
+    if (server_rc == 1) {
+        ctx->server_ip = server_addr;
+    } else {
+        SetLoopbackIP(&ctx->server_ip, family);
+    }
+
+    ctx->ip_addrs_valid = 1;
+    suri_log(9, "X-Client-IP=%s, X-Server-IP=%s, address family=%s\n",
+             client_str ? client_str : "loopback fallback",
+             server_str ? server_str : "loopback fallback",
+             family == AF_INET6 ? "IPv6" : "IPv4");
+    return 0;
+}
+
+static const struct suri_ip_addr *GetClientIP(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+    return EnsureIPAddresses(req) == 0 ? &ctx->client_ip : NULL;
 }
 
 static uint16_t GetClientPort(ci_request_t *req)
@@ -591,24 +650,10 @@ static uint16_t GetIcapClientPort(ci_request_t *req)
     return ctx->icap_client_port;
 }
 
-static uint32_t GetServerIP(ci_request_t *req)
+static const struct suri_ip_addr *GetServerIP(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-
-    if (ctx->server_ip_set) {
-        return ctx->server_ip;
-    }
-
-    ctx->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-    ctx->server_ip_set = 1;
-
-    const char *ip_str = ci_icap_request_get_header(req, "X-Server-IP");
-    if (ip_str) {
-        inet_pton(AF_INET, ip_str, &ctx->server_ip);
-    }
-
-    suri_log(9, "X-Server-IP=%s\n", ip_str ? ip_str : "not set, using fallback");
-    return ctx->server_ip;
+    return EnsureIPAddresses(req) == 0 ? &ctx->server_ip : NULL;
 }
 
 static uint32_t GetServerPort(ci_request_t *req)
@@ -785,8 +830,15 @@ static struct suri_conn_key GetConnKey(ci_request_t *req)
 
     memset(&ctx->key, 0, sizeof(struct suri_conn_key));
 
-    ctx->key.src_ip = GetClientIP(req);
-    ctx->key.dst_ip = GetServerIP(req);
+    const struct suri_ip_addr *client_ip = GetClientIP(req);
+    const struct suri_ip_addr *server_ip = GetServerIP(req);
+    if (client_ip == NULL || server_ip == NULL) {
+        ctx->key_set = 0;
+        memset(&ctx->key, 0, sizeof(ctx->key));
+        return ctx->key;
+    }
+    ctx->key.src_ip = *client_ip;
+    ctx->key.dst_ip = *server_ip;
     ctx->key.src_port = GetClientPort(req);
     ctx->key.dst_port = GetServerPort(req);
     ctx->key.stream_id = GetStreamID(req);
@@ -837,114 +889,189 @@ static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
                     ctx->client_seq, ctx->client_ack, ctx->server_seq, ctx->server_ack);
 }
 
-// Create emulated packet
-static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver, size_t *pkt_len)
+/* Add bytes to a one's-complement checksum accumulator. */
+static uint32_t ChecksumAdd(uint32_t sum, const uint8_t *data, size_t len)
 {
-    struct suri_ctx *ctx = ci_service_data(req);
+    while (len >= 2) {
+        sum += ((uint32_t)data[0] << 8) | data[1];
+        data += 2;
+        len -= 2;
+    }
+    if (len != 0) {
+        sum += (uint32_t)data[0] << 8;
+    }
+    return sum;
+}
 
-    size_t header_len = sizeof(struct fake_pkt_hdr);
-    // Allocate 4 extra bytes for the TCP option (Kind + Length + 2-byte Port)
-    size_t opt_len = (GetProto(req) == IPPROTO_TCP) ? 4 : 0;
+static uint16_t ChecksumFinish(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xffffU) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
 
-    *pkt_len = header_len + opt_len + data_len;
+static uint16_t TransportChecksum(const struct suri_ip_addr *src,
+                                  const struct suri_ip_addr *dst,
+                                  uint8_t protocol,
+                                  const uint8_t *transport,
+                                  size_t transport_len)
+{
+    uint32_t sum = 0;
+    uint8_t pseudo_tail[8] = {0};
 
-    uint8_t *pkt = malloc(*pkt_len);
-    if (pkt == NULL) {
-        suri_log(1, "malloc failed for pkt\n");
+    if (src->family == AF_INET) {
+        sum = ChecksumAdd(sum, src->addr, 4);
+        sum = ChecksumAdd(sum, dst->addr, 4);
+        pseudo_tail[1] = protocol;
+        pseudo_tail[2] = (uint8_t)((transport_len >> 8) & 0xff);
+        pseudo_tail[3] = (uint8_t)(transport_len & 0xff);
+        sum = ChecksumAdd(sum, pseudo_tail, 4);
+    } else {
+        uint8_t pseudo_len[4] = {
+            (uint8_t)((transport_len >> 24) & 0xff),
+            (uint8_t)((transport_len >> 16) & 0xff),
+            (uint8_t)((transport_len >> 8) & 0xff),
+            (uint8_t)(transport_len & 0xff)
+        };
+        sum = ChecksumAdd(sum, src->addr, 16);
+        sum = ChecksumAdd(sum, dst->addr, 16);
+        sum = ChecksumAdd(sum, pseudo_len, sizeof(pseudo_len));
+        pseudo_tail[7] = protocol;
+        sum = ChecksumAdd(sum, pseudo_tail, sizeof(pseudo_tail));
+    }
+
+    sum = ChecksumAdd(sum, transport, transport_len);
+    return ChecksumFinish(sum);
+}
+
+static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len,
+                             uint16_t flags, int toserver, size_t *pkt_len)
+{
+    const struct suri_ip_addr *client_ip = GetClientIP(req);
+    const struct suri_ip_addr *server_ip = GetServerIP(req);
+    if (client_ip == NULL || server_ip == NULL || client_ip->family != server_ip->family) {
+        suri_log(1, "Cannot construct packet: missing, invalid, or mixed-family IP addresses\n");
         return NULL;
     }
 
-    // Zero out both the fake header block and the option block
-    memset(pkt, 0, header_len + opt_len);
+    if (data_len < 0 || (data_len > 0 && data == NULL)) {
+        suri_log(1, "Invalid packet payload (data_len=%d)\n", data_len);
+        return NULL;
+    }
 
-    struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt;
+    struct suri_ctx *ctx = ci_service_data(req);
+    const int family = client_ip->family;
+    const uint8_t protocol = GetProto(req);
+    const int is_tcp = protocol == IPPROTO_TCP;
+    const int is_udp = protocol == IPPROTO_UDP;
+    if (!is_tcp && !is_udp) {
+        suri_log(1, "Unsupported transport protocol %u\n", protocol);
+        return NULL;
+    }
 
-#ifdef __linux__
-    // Linux struct iphdr and struct tcphdr field mappings
-    hdr->ip.version = 4;
-    hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
-    hdr->ip.tot_len = htons(*pkt_len);
-    hdr->ip.ttl = 64;
+    const size_t ip_header_len = family == AF_INET ? 20U : sizeof(struct ip6_hdr);
+    const size_t tcp_option_len = is_tcp ? 4U : 0U;
+    const size_t transport_header_len = is_tcp ? 20U + tcp_option_len : 8U;
+    const size_t transport_len = transport_header_len + (size_t)data_len;
+    const size_t max_payload_len = 65535U;
 
-    hdr->ip.protocol = GetProto(req);
+    if ((family == AF_INET && ip_header_len + transport_len > max_payload_len) ||
+        (family == AF_INET6 && transport_len > max_payload_len)) {
+        suri_log(1, "Synthetic packet exceeds maximum non-jumbo IP packet size\n");
+        return NULL;
+    }
 
-    suri_log(9, "Set IP/Port, direction to %s\n", toserver ? "server" : "client");
-    hdr->ip.saddr = toserver ? GetClientIP(req) : GetServerIP(req);
-    hdr->ip.daddr = toserver ? GetServerIP(req) : GetClientIP(req);
+    *pkt_len = ip_header_len + transport_len;
+    uint8_t *pkt = calloc(1, *pkt_len);
+    if (pkt == NULL) {
+        suri_log(1, "calloc failed for synthetic packet\n");
+        return NULL;
+    }
 
-    if (hdr->ip.protocol == IPPROTO_TCP) {
-        // Use ICAP client port for the standard L4 tuple
-        // This allows Suricata to distinguish different h2/h3 streams.
-        hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
-        hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
+    const struct suri_ip_addr *src_ip = toserver ? client_ip : server_ip;
+    const struct suri_ip_addr *dst_ip = toserver ? server_ip : client_ip;
 
-        hdr->tcp.doff = 6;                  /* 6 dwords = 24 bytes (20B header + 4B option) */
-        hdr->tcp.syn = flags & TH_SYN ? 1 : 0;
-        hdr->tcp.ack = flags & TH_ACK ? 1 : 0;
-        hdr->tcp.psh = flags & TH_PUSH ? 1 : 0;
-        hdr->tcp.fin = flags & TH_FIN ? 1 : 0;
+    /* Build a raw IPv4 or IPv6 header. */
+    if (family == AF_INET) {
+        pkt[0] = 0x45;                               /* Version 4, IHL 5 */
+        pkt[8] = 64;                                 /* TTL */
+        pkt[9] = protocol;
+        uint16_t total_len = htons((uint16_t)*pkt_len);
+        memcpy(pkt + 2, &total_len, sizeof(total_len));
+        memcpy(pkt + 12, src_ip->addr, 4);
+        memcpy(pkt + 16, dst_ip->addr, 4);
+    } else {
+        pkt[0] = 0x60;                               /* Version 6, traffic class/flow label 0 */
+        uint16_t payload_len = htons((uint16_t)transport_len);
+        memcpy(pkt + 4, &payload_len, sizeof(payload_len));
+        pkt[6] = protocol;                           /* Next Header */
+        pkt[7] = 64;                                 /* Hop Limit */
+        memcpy(pkt + 8, src_ip->addr, 16);
+        memcpy(pkt + 24, dst_ip->addr, 16);
+    }
 
-        suri_log(7, "Set flags syn=%u, ack=%u, psh=%u, fin=%u\n", hdr->tcp.syn, hdr->tcp.ack, hdr->tcp.psh, hdr->tcp.fin);
-#else
-    // BSD struct ip and struct tcphdr field mappings
-    hdr->ip.ip_v = 4;
-    hdr->ip.ip_hl = 5;                        /* 5 dwords = 20 bytes */
-    hdr->ip.ip_len = htons(*pkt_len);
-    hdr->ip.ip_ttl = 64;
-    hdr->ip.ip_p = GetProto(req);
+    uint8_t *transport = pkt + ip_header_len;
+    if (is_tcp) {
+        /* TCP base header (20 bytes) plus the existing 4-byte client-port option. */
+        uint16_t source_port = toserver ? GetIcapClientPort(req) : GetServerPort(req);
+        uint16_t dest_port = toserver ? GetServerPort(req) : GetIcapClientPort(req);
+        memcpy(transport, &source_port, sizeof(source_port));
+        memcpy(transport + 2, &dest_port, sizeof(dest_port));
 
-    suri_log(9, "Set IP/Port, direction to %s\n", toserver ? "server" : "client");
-    hdr->ip.ip_src.s_addr = toserver ? GetClientIP(req) : GetServerIP(req);
-    hdr->ip.ip_dst.s_addr = toserver ? GetServerIP(req) : GetClientIP(req);
+        GetSeqAck(req, (size_t)data_len, toserver);
+        uint32_t seq = htonl(toserver ? ctx->client_seq : ctx->server_seq);
+        uint32_t ack = htonl(toserver ? ctx->client_ack : ctx->server_ack);
+        memcpy(transport + 4, &seq, sizeof(seq));
+        memcpy(transport + 8, &ack, sizeof(ack));
+        transport[12] = 0x60;                        /* Data offset: 6 x 32-bit words */
+        transport[13] = (uint8_t)(flags & (TH_FIN | TH_SYN | TH_RST | TH_PUSH | TH_ACK | TH_URG));
+        uint16_t window = htons(65535);
+        memcpy(transport + 14, &window, sizeof(window));
 
-    if (hdr->ip.ip_p == IPPROTO_TCP) {
-        // Use ICAP client port for the standard L4 tuple
-        // This allows Suricata to distinguish different h2/h3 streams.
-        hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
-        hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
-
-        hdr->tcp.th_off = 6;                  /* 6 dwords = 24 bytes (20B header + 4B option) */
-
-        // BSD TCP flag handling
-        if (flags & TH_SYN)  hdr->tcp.th_flags |= TH_SYN;
-        if (flags & TH_ACK)  hdr->tcp.th_flags |= TH_ACK;
-        if (flags & TH_PUSH) hdr->tcp.th_flags |= TH_PUSH;
-        if (flags & TH_FIN)  hdr->tcp.th_flags |= TH_FIN;
-
-        suri_log(7, "Set flags syn=%u, ack=%u, psh=%u, fin=%u\n",
-                 (hdr->tcp.th_flags & TH_SYN) ? 1 : 0,
-                 (hdr->tcp.th_flags & TH_ACK) ? 1 : 0,
-                 (hdr->tcp.th_flags & TH_PUSH) ? 1 : 0,
-                 (hdr->tcp.th_flags & TH_FIN) ? 1 : 0);
-#endif
-
-        // ATTENTION: Suricata does NOT detect unless we set th_win (otherwise, flow will have error events)
-        hdr->tcp.th_win = htons(65535);
-
-        GetSeqAck(req, data_len, toserver);
-
-        hdr->tcp.th_seq = toserver ? htonl(ctx->client_seq) : htonl(ctx->server_seq);
-        hdr->tcp.th_ack = toserver ? htonl(ctx->client_ack) : htonl(ctx->server_ack);
-
-        // Inject the actual client port as a TCP option
-        uint8_t *opt_ptr = pkt + header_len;
+        uint8_t *option = transport + 20;
         uint16_t actual_client_port = GetClientPort(req);
+        option[0] = 78;                              /* Historical proxy/enterprise option */
+        option[1] = 4;
+        memcpy(option + 2, &actual_client_port, sizeof(actual_client_port));
 
-        opt_ptr[0] = 78;   // Option Kind: Historical Proxy/Enterprise Option
-        opt_ptr[1] = 4;    // Option Length: 4 bytes total
-        opt_ptr[2] = (actual_client_port >> 8) & 0xFF; // Port high byte
-        opt_ptr[3] = actual_client_port & 0xFF;        // Port low byte
-
-        // Revert byte order for printing
-        suri_log(7, "Set %s seq=%u, ack=%u, real_port=%u, icap_client_port=%u\n",
-                 toserver ? "client" : "server", ntohl(hdr->tcp.th_seq), ntohl(hdr->tcp.th_ack),
+        suri_log(7, "Set %s TCP seq=%u, ack=%u, real_port=%u, icap_client_port=%u\n",
+                 toserver ? "client" : "server", ntohl(seq), ntohl(ack),
                  ntohs(actual_client_port), ntohs(GetIcapClientPort(req)));
+    } else {
+        uint16_t source_port = toserver ? GetIcapClientPort(req) : GetServerPort(req);
+        uint16_t dest_port = toserver ? GetServerPort(req) : GetIcapClientPort(req);
+        uint16_t udp_len = htons((uint16_t)transport_len);
+        memcpy(transport, &source_port, sizeof(source_port));
+        memcpy(transport + 2, &dest_port, sizeof(dest_port));
+        memcpy(transport + 4, &udp_len, sizeof(udp_len));
+        /* UDP checksum is mandatory for IPv6; calculate it for both families. */
     }
 
     if (data_len > 0) {
-        // Shift data target forward to account for the option length
-        memcpy(pkt + header_len + opt_len, data, data_len);
+        memcpy(transport + transport_header_len, data, (size_t)data_len);
     }
+
+    /* Calculate transport checksum over the final transport header and payload. */
+    uint16_t transport_checksum = TransportChecksum(src_ip, dst_ip, protocol, transport, transport_len);
+    if (!is_tcp && transport_checksum == 0) {
+        transport_checksum = 0xffff;              /* Zero means disabled for IPv4 UDP, forbidden for IPv6 UDP. */
+    }
+    transport_checksum = htons(transport_checksum);
+    if (is_tcp) {
+        memcpy(transport + 16, &transport_checksum, sizeof(transport_checksum));
+    } else {
+        memcpy(transport + 6, &transport_checksum, sizeof(transport_checksum));
+    }
+
+    if (family == AF_INET) {
+        uint16_t ip_checksum = htons(ChecksumFinish(ChecksumAdd(0, pkt, ip_header_len)));
+        memcpy(pkt + 10, &ip_checksum, sizeof(ip_checksum));
+    }
+
+    suri_log(7, "Built %s/%s packet, direction=%s, total_len=%zu, payload_len=%d\n",
+             family == AF_INET6 ? "IPv6" : "IPv4", is_tcp ? "TCP" : "UDP",
+             toserver ? "server" : "client", *pkt_len, data_len);
     return pkt;
 }
 
@@ -954,7 +1081,7 @@ static pthread_mutex_t g_live_device_mutex = PTHREAD_MUTEX_INITIALIZER;
 // InjectPacket — wrap raw bytes in a minimal Suricata Packet and push
 // it through the detection engine.
 // We present the payload as a raw segment on a fake loopback device.
-static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver)
+static int InjectSinglePacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver)
 {
     // Pull the unique thread-local worker context safely from key storage
     ThreadVars *my_tv = GetThreadWorkerVars();
@@ -1058,6 +1185,42 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     // ATTENTION: Do not recycle the packet with thread-local TVs, it will be handled by the Suricata engine
     // TmqhOutputPacketpool(my_tv, p);
     return rv;
+}
+
+/* TCP is a byte stream, so split large ICAP chunks into legal IP packets. UDP
+ * remains one datagram and is rejected by CreatePacket if it exceeds its limit. */
+static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver)
+{
+    if (data_len < 0 || (data_len > 0 && data == NULL)) {
+        suri_log(1, "Invalid injection payload (data_len=%d)\n", data_len);
+        return -1;
+    }
+
+    if (data_len == 0 || GetProto(req) != IPPROTO_TCP) {
+        return InjectSinglePacket(req, data, data_len, flags, toserver);
+    }
+
+    /* 60,000 leaves room for IPv4/IPv6 and the synthetic TCP option headers. */
+    const int max_segment_payload = 60000;
+    int offset = 0;
+    while (offset < data_len) {
+        int chunk_len = data_len - offset;
+        if (chunk_len > max_segment_payload) {
+            chunk_len = max_segment_payload;
+        }
+
+        uint16_t segment_flags = flags;
+        if (offset + chunk_len < data_len) {
+            segment_flags &= (uint16_t)~TH_PUSH; /* PSH belongs on the final stream segment. */
+        }
+
+        int rv = InjectSinglePacket(req, data + offset, chunk_len, segment_flags, toserver);
+        if (rv != 0) {
+            return rv;
+        }
+        offset += chunk_len;
+    }
+    return 0;
 }
 
 static void suri_cfg_set(ci_service_xdata_t *srv_xdata)
@@ -1589,7 +1752,8 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
 
         // In non-command/response protocols like HTTP, seq numbers are passed from reqmod to respmod only, so do not save them in respmod.
         // And if the conn state is FIN, we have already deleted the connection from the table, so do not recreate it.
-        if ((req->type == ICAP_RESPMOD && !IsCommandResponseProto(req)) || ctx->state == FIN) {
+        if (GetProto(req) != IPPROTO_TCP ||
+            (req->type == ICAP_RESPMOD && !IsCommandResponseProto(req)) || ctx->state == FIN) {
             break;
         }
 
@@ -1660,11 +1824,23 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 
     suri_log(7, "Injecting %d bytes into Suricata\n", preview_data_len);
 
-    suri_get_conn_state(req);
+    if (EnsureIPAddresses(req) != 0) {
+        suri_log(1, "Cannot inspect request with invalid or mixed-family endpoint addresses\n");
+        rv = -1;
+        goto out;
+    }
+
+    const int is_tcp = GetProto(req) == IPPROTO_TCP;
+    if (is_tcp) {
+        suri_get_conn_state(req);
+    } else {
+        /* UDP has no TCP handshake or sequence-number state. */
+        ctx->state = ESTABLISHED;
+    }
 
     int emulate_get_request = 0;
 
-    if (ctx->state == SYN) {
+    if (is_tcp && ctx->state == SYN) {
         if (req->type == ICAP_RESPMOD && IsHTTP(req)) {
             emulate_get_request = 1;
         }
@@ -1734,7 +1910,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
             goto out;
         }
 
-        if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
+        if (is_tcp && !StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
             ctx->injected_since_ack = preview_data_len;
 
             // ATTENTION: In IDS mode Suricata does not detect unless we also inject these final ACK packets to flush the flow
@@ -1807,7 +1983,10 @@ int suri_end_of_data_handler(ci_request_t *req)
     // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
     // Only inject FIN packets if the connection is not a command/response protocol like POP3/SMTP,
     // or if the connection state is finished with a command/response protocol
-    if ((req->type != ICAP_REQMOD || ctx->error) && (!IsCommandResponseProto(req) || GetConnStateFinished(req)) && !ctx->block && ctx->state != FIN) {
+    if (GetProto(req) == IPPROTO_TCP &&
+        (req->type != ICAP_REQMOD || ctx->error) &&
+        (!IsCommandResponseProto(req) || GetConnStateFinished(req)) &&
+        !ctx->block && ctx->state != FIN) {
         ctx->state = FIN;
 
         // We terminate the flow by injecting a FIN packet, so its conn state in the connection table becomes stale.
@@ -1889,7 +2068,7 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         char inject_buf[inject_len];
         dual_ring_buf_suri_read(ctx->body_buf, inject_buf, inject_len);
 
-        if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
+        if (GetProto(req) == IPPROTO_TCP && !StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
             ctx->injected_since_ack += inject_len;
         }
 
@@ -1908,7 +2087,7 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         *wlen = CI_EOF;
     }
 
-    if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
+    if (GetProto(req) == IPPROTO_TCP && !StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
         // This io function may be called after end_of_data_handler and when we set CI_EOF above,
         // so do not inject duplicate ACK packets, hence ctx->state != FIN and ctx->injected_since_ack > 0
         if ((ctx->injected_since_ack >= SURI_ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && ctx->state != FIN) {
